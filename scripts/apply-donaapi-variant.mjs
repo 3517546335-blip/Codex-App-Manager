@@ -44,7 +44,7 @@ const edits = [
   {
     path: "README.md",
     replacements: [
-      ["q4549286/Codex-Desktop-Releases", "q4549286/Codex-Desktop-DonaAPI-Releases"],
+      ["q4549286/Codex-Desktop-Releases", "3517546335-blip/Codex-Desktop-DonaAPI-Releases"],
       ["S1API", "DonaAPI"],
     ],
   },

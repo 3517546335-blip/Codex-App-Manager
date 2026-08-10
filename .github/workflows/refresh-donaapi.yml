@@ -45,7 +45,7 @@ jobs:
           npm test
           npm run build
 
-          git add README.md src/app/components.tsx src/app/views/CodexConfig.tsx src/app/views/Home.tsx src/app/views/WinHome.tsx src/services/managerApi.ts src-tauri/src/commands.rs
+          git add README.md src/app/components.tsx src/app/SpeedApiBanner.test.tsx src/app/views/CodexConfig.tsx src/app/views/Home.tsx src/app/views/WinHome.tsx src/services/managerApi.ts src-tauri/src/commands.rs
           git commit -m "chore(donaapi): refresh variant from main"
 
           if [ -n "$old_sha" ] && [ "$(git rev-parse HEAD^{tree})" = "$(git rev-parse "$old_sha^{tree}")" ]; then

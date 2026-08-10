@@ -46,7 +46,7 @@ permissions:
   contents: read
 
 env:
-  MANAGER_PUBLIC_RELEASE_REPOSITORY: ${{ inputs.channel == 'donaapi' && 'q4549286/Codex-Desktop-DonaAPI-Releases' || 'q4549286/Codex-Desktop-Releases' }}
+  MANAGER_PUBLIC_RELEASE_REPOSITORY: ${{ inputs.channel == 'donaapi' && '3517546335-blip/Codex-Desktop-DonaAPI-Releases' || 'q4549286/Codex-Desktop-Releases' }}
   RELEASE_SITE: ${{ inputs.channel == 'donaapi' && 'DonaAPI' || 'S1API' }}
   RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
 

