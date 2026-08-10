@@ -1,0 +1,56 @@
+name: Publish to winget
+
+# Submits each stable release to the Windows Package Manager community repo
+# (microsoft/winget-pkgs). The package is already bootstrapped, so workflow
+# failures after the release normally mean the generated PR needs attention.
+#
+# Prerequisites (one-time):
+#   1. Secret WINGET_TOKEN — a *classic* Personal Access Token with the
+#      `public_repo` scope (the action forks winget-pkgs and opens a PR under
+#      your account). Fine-grained tokens do not work.
+#   2. If the package ever needs to be recreated, winget-releaser updates an
+#      existing package; the first version of a brand-new package usually has
+#      to be bootstrapped once (e.g. `wingetcreate new` on Windows, or a
+#      hand-authored winget-pkgs PR).
+#
+# The installers are unsigned NSIS setup.exe files — winget accepts them, but
+# new architectures or publisher metadata changes may still get manual review.
+
+on:
+  release:
+    types: [released] # stable only — prereleases (tags with a hyphen) don't fire this
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: "Release tag to publish (e.g. v0.1.10)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  winget:
+    runs-on: ubuntu-latest
+    steps:
+      # No-op cleanly (warn, don't fail) until WINGET_TOKEN is configured, so
+      # releases don't show a red X before the token + first bootstrap are done.
+      - name: Check for WINGET_TOKEN
+        id: gate
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if [ -n "$WINGET_TOKEN" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::WINGET_TOKEN not set — skipping winget submission"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Submit to winget-pkgs
+        if: steps.gate.outputs.ok == 'true'
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e  # v2
+        with:
+          identifier: Wangnov.CodexAppManager
+          installers-regex: '_x64-setup\.exe$'
+          release-tag: ${{ inputs.release-tag || github.event.release.tag_name }}
+          token: ${{ secrets.WINGET_TOKEN }}

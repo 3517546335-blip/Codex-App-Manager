@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex App Manager - 自动检查更新设置原型</title>
+    <style>
+      :root {
+        --brand-violet: oklch(0.78 0.13 286);
+        --brand-blue: oklch(0.72 0.15 264);
+        --r-lg: 16px;
+        --r-md: 12px;
+        --r-sm: 9px;
+        --r-pill: 999px;
+        --space-xs: 8px;
+        --space-sm: 12px;
+        --space-md: 16px;
+        --font: ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont,
+          "Segoe UI Variable Display", "Segoe UI", system-ui, "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+        --mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Code",
+          Menlo, Consolas, monospace;
+        --fs-caption: 0.6875rem;
+        --fs-label: 0.75rem;
+        --fs-sm: 0.8125rem;
+        --fs-body: 0.875rem;
+        --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+        --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+        --ease-spring: cubic-bezier(0.34, 1.32, 0.5, 1);
+        --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+      }
+
+      :root,
+      [data-theme="dark"] {
+        color-scheme: dark;
+        --bg: oklch(0.168 0.014 274);
+        --surface: oklch(0.214 0.016 274);
+        --surface-top: oklch(0.246 0.018 274);
+        --surface-2: oklch(0.252 0.018 274);
+        --surface-2-top: oklch(0.288 0.02 274);
+        --surface-3: oklch(0.305 0.02 274);
+        --surface-3-top: oklch(0.34 0.022 274);
+        --line: oklch(0.32 0.018 274);
+        --line-2: oklch(0.4 0.024 274);
+        --text: oklch(0.965 0.008 274);
+        --text-soft: oklch(0.74 0.02 274);
+        --text-faint: oklch(0.58 0.022 274);
+        --accent: oklch(0.71 0.155 274);
+        --accent-2: oklch(0.62 0.19 270);
+        --accent-deep: oklch(0.82 0.11 280);
+        --accent-ink: oklch(0.99 0.01 274);
+        --success: oklch(0.78 0.155 168);
+        --amber: oklch(0.8 0.135 78);
+        --accent-tint: color-mix(in oklch, var(--accent) 18%, transparent);
+        --success-tint: color-mix(in oklch, var(--success) 16%, transparent);
+        --amber-tint: color-mix(in oklch, var(--amber) 16%, transparent);
+        --ring-focus: color-mix(in oklch, var(--accent) 55%, transparent);
+        --hl-top: inset 0 1px 0 oklch(1 0 0 / 0.07);
+        --hl-top-strong: inset 0 1px 0 oklch(1 0 0 / 0.12);
+        --shadow-1: oklch(0.12 0.03 274 / 0.5);
+        --shadow-2: oklch(0.08 0.03 274 / 0.45);
+        --shadow-3: oklch(0.05 0.02 274 / 0.6);
+        --elev-1: var(--hl-top), 0 1px 2px var(--shadow-1);
+        --elev-2: var(--hl-top), 0 1px 2px var(--shadow-1),
+          0 14px 32px -8px var(--shadow-2);
+        --elev-3: var(--hl-top-strong), 0 2px 6px var(--shadow-1),
+          0 28px 64px -10px var(--shadow-3);
+        --grain-opacity: 0.05;
+        --ambient: radial-gradient(
+          125% 80% at 50% -8%,
+          color-mix(in oklch, var(--accent) 9%, transparent),
+          transparent 60%
+        );
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 22px;
+        background:
+          radial-gradient(circle at 50% 0, oklch(0.26 0.04 274), transparent 34%),
+          oklch(0.11 0.015 274);
+        color: var(--text);
+        font-family: var(--font);
+        font-size: var(--fs-body);
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        font-variant-numeric: tabular-nums;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      button:focus,
+      input:focus {
+        outline: none;
+      }
+
+      button:focus-visible,
+      input:focus-visible {
+        outline: 2px solid var(--ring-focus);
+        outline-offset: 2px;
+      }
+
+      .frame {
+        width: 400px;
+        height: 640px;
+        padding: 14px;
+      }
+
+      .pop {
+        position: relative;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        isolation: isolate;
+        background-color: var(--bg);
+        background-image: var(--ambient);
+        border: 1px solid var(--line-2);
+        border-radius: var(--r-lg);
+        box-shadow:
+          inset 0 1px 0 oklch(1 0 0 / 0.06),
+          0 6px 16px var(--shadow-2),
+          0 1px 3px var(--shadow-1);
+      }
+
+      .pop::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image: var(--grain);
+        background-size: 160px 160px;
+        opacity: var(--grain-opacity);
+        pointer-events: none;
+        z-index: -1;
+        mix-blend-mode: overlay;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        gap: var(--space-xs);
+        padding: var(--space-sm) var(--space-sm) 0;
+      }
+
+      .iconbtn,
+      .winclose {
+        width: 30px;
+        height: 30px;
+        border-radius: var(--r-sm);
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--text-faint);
+        display: grid;
+        place-items: center;
+        transition:
+          background 0.18s var(--ease),
+          color 0.18s var(--ease),
+          border-color 0.18s var(--ease),
+          transform 0.08s var(--ease);
+      }
+
+      .iconbtn:hover,
+      .winclose:hover {
+        background: var(--surface-2);
+        border-color: var(--line);
+        color: var(--text);
+      }
+
+      .iconbtn:active,
+      .winclose:active {
+        transform: scale(0.94);
+      }
+
+      .iconbtn svg,
+      .winclose svg,
+      .row-icon {
+        width: 17px;
+        height: 17px;
+      }
+
+      .title {
+        flex: 1;
+        text-align: center;
+        font-weight: 680;
+        letter-spacing: -0.006em;
+      }
+
+      .scroll {
+        flex: 1;
+        overflow-y: auto;
+        padding: var(--space-sm) var(--space-md) var(--space-md);
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-sm);
+      }
+
+      .scroll::-webkit-scrollbar {
+        width: 0;
+      }
+
+      .scroll > * {
+        animation: risein 0.46s var(--ease-out) both;
+      }
+
+      .scroll > *:nth-child(1) {
+        animation-delay: 0.02s;
+      }
+
+      .scroll > *:nth-child(2) {
+        animation-delay: 0.07s;
+      }
+
+      .scroll > *:nth-child(3) {
+        animation-delay: 0.12s;
+      }
+
+      @keyframes risein {
+        from {
+          opacity: 0;
+          transform: translateY(9px);
+        }
+      }
+
+      .group {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-xs);
+      }
+
+      .group-h {
+        font-size: var(--fs-caption);
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+        padding: 2px 6px;
+      }
+
+      .list {
+        background: linear-gradient(180deg, var(--surface-top), var(--surface));
+        border: 1px solid var(--line);
+        border-radius: var(--r-lg);
+        overflow: hidden;
+        box-shadow: var(--elev-2);
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        width: 100%;
+        min-height: 58px;
+        padding: 12px 14px;
+        border: 0;
+        border-top: 1px solid var(--line);
+        background: none;
+        color: var(--text);
+        text-align: start;
+      }
+
+      .row:first-child {
+        border-top: 0;
+      }
+
+      .row-icon {
+        color: var(--text-soft);
+        flex: 0 0 auto;
+      }
+
+      .rtext {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .rtitle {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        min-width: 0;
+        font-weight: 650;
+        letter-spacing: -0.005em;
+      }
+
+      .rsub {
+        color: var(--text-faint);
+        font-size: var(--fs-label);
+        line-height: 1.45;
+        margin-top: 3px;
+      }
+
+      .tag {
+        flex: 0 0 auto;
+        font-size: 10.5px;
+        font-weight: 700;
+        color: var(--accent-deep);
+        background: var(--accent-tint);
+        border: 1px solid color-mix(in oklch, var(--accent) 22%, transparent);
+        border-radius: var(--r-pill);
+        padding: 2px 8px;
+      }
+
+      .tag.quiet {
+        color: var(--text-soft);
+        background: var(--surface-3);
+        border-color: var(--line);
+      }
+
+      .toggle {
+        width: 42px;
+        height: 25px;
+        border-radius: var(--r-pill);
+        background: var(--surface-3);
+        border: 1px solid var(--line-2);
+        position: relative;
+        flex-shrink: 0;
+        box-shadow: inset 0 1px 3px var(--shadow-1);
+        transition:
+          background 0.22s var(--ease),
+          border-color 0.22s var(--ease),
+          opacity 0.18s var(--ease);
+      }
+
+      .toggle[aria-checked="true"] {
+        background: linear-gradient(180deg, var(--accent), var(--accent-2));
+        border-color: transparent;
+        box-shadow:
+          inset 0 1px 0 oklch(1 0 0 / 0.25),
+          0 2px 8px -2px color-mix(in oklch, var(--accent) 34%, transparent);
+      }
+
+      .toggle::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 19px;
+        height: 19px;
+        border-radius: 50%;
+        background: oklch(0.99 0.005 274);
+        box-shadow:
+          0 1px 3px var(--shadow-2),
+          0 1px 1px var(--shadow-1);
+        transition: transform 0.22s var(--ease-spring);
+      }
+
+      .toggle[aria-checked="true"]::after {
+        transform: translateX(17px);
+      }
+
+      .toggle[aria-disabled="true"] {
+        opacity: 0.45;
+        pointer-events: none;
+      }
+
+      .frequency {
+        display: grid;
+        grid-template-rows: 0fr;
+        border-top: 0 solid transparent;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          grid-template-rows 0.28s var(--ease-out),
+          opacity 0.2s var(--ease),
+          transform 0.24s var(--ease),
+          border-color 0.18s var(--ease);
+      }
+
+      .frequency.is-open {
+        grid-template-rows: 1fr;
+        border-top-width: 1px;
+        border-top-color: var(--line);
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .frequency-inner {
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      .frequency-content {
+        padding: 13px 14px 14px;
+        display: grid;
+        gap: 10px;
+      }
+
+      .section-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .section-title strong {
+        font-weight: 650;
+      }
+
+      .pill-summary {
+        color: var(--success);
+        background: var(--success-tint);
+        border: 1px solid color-mix(in oklch, var(--success) 22%, transparent);
+        border-radius: var(--r-pill);
+        padding: 3px 8px;
+        font-size: 10.5px;
+        font-weight: 750;
+        white-space: nowrap;
+      }
+
+      .seg {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 4px;
+        padding: 3px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        border-radius: var(--r-md);
+        box-shadow: inset 0 1px 2px var(--shadow-1);
+      }
+
+      .seg button {
+        min-width: 0;
+        border: 1px solid transparent;
+        border-radius: var(--r-sm);
+        background: transparent;
+        color: var(--text-soft);
+        padding: 7px 5px;
+        font-size: var(--fs-label);
+        font-weight: 700;
+        line-height: 1.15;
+        transition:
+          background 0.18s var(--ease),
+          color 0.18s var(--ease),
+          border-color 0.18s var(--ease),
+          box-shadow 0.18s var(--ease);
+      }
+
+      .seg button:hover:not([aria-selected="true"]) {
+        color: var(--text);
+      }
+
+      .seg button[aria-selected="true"] {
+        background: linear-gradient(180deg, var(--surface-3-top), var(--surface-3));
+        border-color: var(--line-2);
+        color: var(--text);
+        box-shadow: var(--elev-1);
+      }
+
+      .custom-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+        overflow: hidden;
+        max-height: 0;
+        opacity: 0;
+        transform: translateY(-4px);
+        transition:
+          max-height 0.24s var(--ease),
+          opacity 0.2s var(--ease),
+          transform 0.2s var(--ease);
+      }
+
+      .custom-grid.show {
+        max-height: 92px;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .num-field {
+        display: grid;
+        gap: 5px;
+      }
+
+      .num-field label {
+        padding-left: 2px;
+        color: var(--text-faint);
+        font-size: var(--fs-caption);
+        font-weight: 700;
+      }
+
+      .num-field input {
+        width: 100%;
+        height: 36px;
+        border: 1px solid var(--line-2);
+        border-radius: var(--r-sm);
+        background: var(--surface-2);
+        color: var(--text);
+        box-shadow: inset 0 1px 2px var(--shadow-1);
+        padding: 8px 9px;
+        font-family: var(--mono);
+        font-size: 12px;
+        text-align: center;
+      }
+
+      .num-field input:focus {
+        border-color: var(--accent);
+        background: var(--surface);
+        box-shadow:
+          inset 0 1px 2px var(--shadow-1),
+          0 0 0 3px var(--accent-tint);
+      }
+
+      @media (max-width: 440px) {
+        body {
+          padding: 0;
+        }
+
+        .frame {
+          width: 100vw;
+          height: 100vh;
+          padding: 10px;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="frame" aria-label="自动检查更新设置原型">
+      <section class="pop">
+        <header class="topbar">
+          <button class="iconbtn" type="button" aria-label="返回">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="15 6 9 12 15 18"></polyline>
+            </svg>
+          </button>
+          <div class="title">设置</div>
+          <button class="winclose" type="button" aria-label="关闭">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+            </svg>
+          </button>
+        </header>
+
+        <div class="scroll">
+          <section class="group">
+            <div class="group-h">更新源</div>
+            <div class="list">
+              <button class="row" type="button" aria-checked="true">
+                <svg class="row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="8.5"></circle>
+                  <path d="M3.5 12h17M12 3.5c2.5 2.4 2.5 14.6 0 17M12 3.5c-2.5 2.4-2.5 14.6 0 17"></path>
+                </svg>
+                <span class="rtext">
+                  <span class="rtitle">自动 <span class="tag">推荐</span></span>
+                  <span class="rsub">自动选择最快、可用的来源</span>
+                </span>
+              </button>
+            </div>
+          </section>
+
+          <section class="group">
+            <div class="group-h">通用</div>
+            <div class="list">
+              <div class="row">
+                <svg class="row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M20 11.5a8 8 0 1 0-1.9 6.4"></path>
+                  <polyline points="20 4.5 20 11.5 13 11.5"></polyline>
+                </svg>
+                <span class="rtext">
+                  <span class="rtitle">启动时自动检查更新</span>
+                </span>
+                <button id="startupToggle" class="toggle" type="button" role="switch"
+                  aria-checked="true" aria-label="启动时自动检查更新"></button>
+              </div>
+
+              <div class="row">
+                <svg class="row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="8.5"></circle>
+                  <path d="M12 7v5l3.2 2"></path>
+                </svg>
+                <span class="rtext">
+                  <span class="rtitle">定时自动检查更新</span>
+                </span>
+                <button id="periodicToggle" class="toggle" type="button" role="switch"
+                  aria-checked="true" aria-label="定时自动检查更新"></button>
+              </div>
+
+              <div id="frequencyPanel" class="frequency is-open" aria-hidden="false">
+                <div class="frequency-inner">
+                  <div class="frequency-content">
+                    <div class="section-title">
+                      <strong>每隔多久检查一次</strong>
+                      <span id="summaryPill" class="pill-summary">每 1 小时</span>
+                    </div>
+
+                    <div class="seg" role="tablist" aria-label="检查频率">
+                      <button type="button" data-preset="900" aria-selected="false">15 分钟</button>
+                      <button type="button" data-preset="3600" aria-selected="true">1 小时</button>
+                      <button type="button" data-preset="21600" aria-selected="false">6 小时</button>
+                      <button type="button" data-preset="custom" aria-selected="false">自定义</button>
+                    </div>
+
+                    <div id="customGrid" class="custom-grid" aria-label="自定义检查频率">
+                      <div class="num-field">
+                        <label for="hours">时</label>
+                        <input id="hours" type="number" inputmode="numeric" min="0" max="168" value="1" />
+                      </div>
+                      <div class="num-field">
+                        <label for="minutes">分</label>
+                        <input id="minutes" type="number" inputmode="numeric" min="0" max="59" value="0" />
+                      </div>
+                      <div class="num-field">
+                        <label for="seconds">秒</label>
+                        <input id="seconds" type="number" inputmode="numeric" min="0" max="59" value="0" />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const MIN_SECONDS = 300;
+      const startupToggle = document.querySelector("#startupToggle");
+      const periodicToggle = document.querySelector("#periodicToggle");
+      const frequencyPanel = document.querySelector("#frequencyPanel");
+      const customGrid = document.querySelector("#customGrid");
+      const summaryPill = document.querySelector("#summaryPill");
+      const presetButtons = Array.from(document.querySelectorAll("[data-preset]"));
+      const inputs = {
+        hours: document.querySelector("#hours"),
+        minutes: document.querySelector("#minutes"),
+        seconds: document.querySelector("#seconds"),
+      };
+
+      let selectedPreset = "3600";
+
+      function isOn(button) {
+        return button.getAttribute("aria-checked") === "true";
+      }
+
+      function setToggle(button, value) {
+        button.setAttribute("aria-checked", value ? "true" : "false");
+      }
+
+      function readCustomSeconds() {
+        const hours = Math.max(0, Number(inputs.hours.value || 0));
+        const minutes = Math.max(0, Number(inputs.minutes.value || 0));
+        const seconds = Math.max(0, Number(inputs.seconds.value || 0));
+        return hours * 3600 + minutes * 60 + seconds;
+      }
+
+      function selectedSeconds() {
+        if (selectedPreset === "custom") return Math.max(MIN_SECONDS, readCustomSeconds());
+        return Number(selectedPreset);
+      }
+
+      function formatSeconds(total) {
+        const seconds = Math.max(MIN_SECONDS, Number(total) || 0);
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = seconds % 60;
+        const parts = [];
+        if (h) parts.push(`${h} 小时`);
+        if (m) parts.push(`${m} 分钟`);
+        if (s) parts.push(`${s} 秒`);
+        return parts.length ? parts.join(" ") : "5 分钟";
+      }
+
+      function updateUi() {
+        const periodic = isOn(periodicToggle);
+        const seconds = selectedSeconds();
+        const label = `每 ${formatSeconds(seconds)}`;
+
+        frequencyPanel.classList.toggle("is-open", periodic);
+        frequencyPanel.setAttribute("aria-hidden", periodic ? "false" : "true");
+        customGrid.classList.toggle("show", selectedPreset === "custom");
+        summaryPill.textContent = label;
+
+        presetButtons.forEach((button) => {
+          button.setAttribute(
+            "aria-selected",
+            button.dataset.preset === selectedPreset ? "true" : "false",
+          );
+        });
+      }
+
+      startupToggle.addEventListener("click", () => {
+        setToggle(startupToggle, !isOn(startupToggle));
+        updateUi();
+      });
+
+      periodicToggle.addEventListener("click", () => {
+        setToggle(periodicToggle, !isOn(periodicToggle));
+        updateUi();
+      });
+
+      presetButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          selectedPreset = button.dataset.preset;
+          updateUi();
+        });
+      });
+
+      Object.values(inputs).forEach((input) => {
+        input.addEventListener("input", () => {
+          selectedPreset = "custom";
+          updateUi();
+        });
+      });
+
+      updateUi();
+    </script>
+  </body>
+</html>

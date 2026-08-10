@@ -1,0 +1,210 @@
+import { invoke } from "@tauri-apps/api/core";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { DEFAULT_SETTINGS } from "../shared/types";
+import { isNetworkError, managerApi, SETTINGS_CHANGED_EVENT } from "./managerApi";
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+}));
+
+const invokeMock = vi.mocked(invoke);
+
+beforeEach(() => {
+  invokeMock.mockReset();
+  vi.stubGlobal("window", { open: vi.fn(), __TAURI_INTERNALS__: undefined });
+  localStorage.clear();
+});
+
+describe("isNetworkError", () => {
+  it("classifies transport and TLS failures as connectivity errors", () => {
+    expect(
+      isNetworkError(
+        "update engine error: io error: curl failed for host=codexapp.agentsmirror.com exit=35: stderr='curl: (35) schannel: failed to receive handshake, SSL/TLS connection failed'",
+      ),
+    ).toBe(true);
+    expect(isNetworkError("curl: (6) Could not resolve host: codexapp.agentsmirror.com")).toBe(
+      true,
+    );
+    expect(isNetworkError("curl: (28) Operation timed out after 20000 milliseconds")).toBe(true);
+  });
+
+  it("classifies the macOS auto-source fallback failure as connectivity", () => {
+    expect(
+      isNetworkError("both the mirror and OpenAI official appcast are unreachable"),
+    ).toBe(true);
+  });
+
+  it("does not treat server responses or verification failures as connectivity", () => {
+    expect(
+      isNetworkError(
+        "update engine error: curl failed for https://example.test/appcast.xml: curl: (22) The requested URL returned error: 404",
+      ),
+    ).toBe(false);
+    expect(isNetworkError("appcast enclosure missing edSignature")).toBe(false);
+    expect(isNetworkError("EdDSA signature does not match")).toBe(false);
+  });
+});
+
+describe("settings API", () => {
+  it("normalizes legacy Codex checks to an embedded startup comparison", async () => {
+    localStorage.setItem(
+      "cam.settings",
+      JSON.stringify({
+        source: "mirror",
+        customUrl: "",
+        autoCheck: false,
+        askBefore: true,
+        signedOnly: true,
+      }),
+    );
+
+    const settings = await managerApi.getSettings();
+
+    expect(settings.source).toBe("mirror");
+    expect(settings.autoCheck).toBe(false);
+    expect(settings.checkOnStartup).toBe(true);
+    expect(settings.periodicCheck).toBe(false);
+    expect(settings.periodicCheckIntervalSeconds).toBe(15 * 60);
+    expect(settings.disableCodexSelfUpdates).toBe(false);
+  });
+
+  it("normalizes and broadcasts browser settings writes", async () => {
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", {
+      open: vi.fn(),
+      __TAURI_INTERNALS__: undefined,
+      dispatchEvent,
+    });
+
+    const saved = await managerApi.setSettings({
+      ...DEFAULT_SETTINGS,
+      periodicCheckIntervalSeconds: 0,
+      disableCodexSelfUpdates: true,
+    });
+
+    expect(saved.periodicCheckIntervalSeconds).toBe(60);
+    expect(saved.disableCodexSelfUpdates).toBe(true);
+    expect(dispatchEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: SETTINGS_CHANGED_EVENT,
+        detail: saved,
+      }),
+    );
+  });
+
+  it("coerces empty custom source and proxy modes to real defaults", async () => {
+    const dispatchEvent = vi.fn();
+    vi.stubGlobal("window", {
+      open: vi.fn(),
+      __TAURI_INTERNALS__: undefined,
+      dispatchEvent,
+    });
+
+    const saved = await managerApi.setSettings({
+      ...DEFAULT_SETTINGS,
+      source: "custom",
+      customUrl: "  ",
+      proxyMode: "custom",
+      customProxyUrl: "",
+    });
+
+    expect(saved.source).toBe("auto");
+    expect(saved.customUrl).toBe("");
+    expect(saved.proxyMode).toBe("system");
+    expect(saved.customProxyUrl).toBe("");
+  });
+});
+
+describe("diagnostics API", () => {
+  it("returns browser fallbacks without invoking Tauri", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const diagnostics = await managerApi.getDiagnostics();
+
+    expect(diagnostics.os).toBe("browser");
+    await expect(managerApi.openLogsDir()).resolves.toBeUndefined();
+    await expect(managerApi.openCodexHome()).resolves.toBeUndefined();
+    await expect(managerApi.frontendReady("en", 1, "browser-token")).resolves.toBeUndefined();
+    await expect(
+      managerApi.reportFrontendError({
+        kind: "test",
+        message: "boom",
+        stack: null,
+        componentStack: null,
+      }),
+    ).resolves.toBeUndefined();
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith(
+      "[frontend]",
+      expect.objectContaining({ kind: "test", message: "boom" }),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("reports frontend readiness and application language through IPC", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    invokeMock.mockResolvedValue(undefined);
+
+    await expect(managerApi.frontendReady("zh-TW", 7, "generation-token")).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenCalledWith("frontend_ready", {
+      lang: "zh-TW",
+      generation: 7,
+      token: "generation-token",
+    });
+  });
+
+  it("invokes diagnostics commands inside Tauri", async () => {
+    window.__TAURI_INTERNALS__ = {};
+    const diagnostics = {
+      appVersion: "0.1.17",
+      os: "macos",
+      arch: "aarch64",
+      locale: null,
+      updateSource: "auto",
+      customSourceHost: null,
+      windowsInstallMode: null,
+      installStatus: "macos status=none",
+      configHealth: {
+        settingsStatus: "ok",
+        provenanceStatus: "ok",
+        unknownSource: null,
+        detail: null,
+        settingsBackupAvailable: false,
+        provenanceBackupAvailable: false,
+      },
+      logsDir: "/tmp/logs",
+      recentErrors: [],
+      logTail: "",
+      generatedAtUnix: 1,
+    };
+    invokeMock
+      .mockResolvedValueOnce(diagnostics)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined);
+
+    await expect(managerApi.getDiagnostics()).resolves.toEqual(diagnostics);
+    await expect(managerApi.openLogsDir()).resolves.toBeUndefined();
+    await expect(managerApi.openCodexHome()).resolves.toBeUndefined();
+    await expect(
+      managerApi.reportFrontendError({
+        kind: "test",
+        message: "boom",
+        stack: null,
+        componentStack: null,
+      }),
+    ).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_diagnostics");
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "open_logs_dir");
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "open_codex_home");
+    expect(invokeMock).toHaveBeenNthCalledWith(4, "log_frontend_error", {
+      payload: {
+        kind: "test",
+        message: "boom",
+        stack: null,
+        componentStack: null,
+      },
+    });
+  });
+});

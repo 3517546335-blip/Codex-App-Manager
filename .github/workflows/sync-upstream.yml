@@ -1,0 +1,116 @@
+name: Sync upstream
+
+# Keep this customized fork close to Wangnov/Codex-App-Manager automatically.
+# Clean upstream merges are validated and pushed directly to main. Conflicts or
+# failing checks stop before main is changed.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+
+      - name: Install Linux Tauri dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Merge upstream and validate
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Wangnov/Codex-App-Manager.git
+          git fetch upstream main
+          git fetch origin main
+          git checkout -B sync/upstream-main origin/main
+
+          bridged=false
+          if ! git merge-base HEAD upstream/main >/dev/null; then
+            echo "::warning::No shared history with upstream/main; creating an ours-strategy bridge merge so future upstream syncs can merge normally."
+            git merge \
+              --allow-unrelated-histories \
+              --no-ff \
+              -s ours \
+              -m "Bridge upstream history for future syncs" \
+              upstream/main
+            bridged=true
+          else
+            if ! git merge --no-edit upstream/main; then
+              git merge --abort || true
+              upstream_tree="$(git rev-parse upstream/main^{tree})"
+              matching_snapshot="$(
+                git log --format='%H %T' |
+                  awk -v tree="$upstream_tree" '$2 == tree && found == "" { found = $1 } END { print found }'
+              )"
+              if [ -z "$matching_snapshot" ]; then
+                echo "::error::Upstream sync has conflicts and no verified matching upstream snapshot exists. Resolve manually, then rerun."
+                exit 1
+              fi
+              echo "::warning::Regular merge conflicted, but ancestor $matching_snapshot has the exact upstream tree $upstream_tree; bridging the real upstream history without changing the validated customized tree."
+              git merge \
+                --no-ff \
+                -s ours \
+                -m "Bridge verified upstream snapshot into history" \
+                upstream/main
+              bridged=true
+            fi
+          fi
+
+          if [ "$bridged" != "true" ] && git diff --quiet origin/main..HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes to sync."
+            exit 0
+          fi
+
+          bash scripts/assert-no-zh-patcher.sh
+          npm ci
+          npm run check
+          npm test
+          npm run build
+          cargo test --manifest-path src-tauri/Cargo.toml --workspace
+
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        run: |
+          if [ "${{ steps.sync.outputs.changed }}" = "true" ]; then
+            echo "Synced upstream/main into main."
+          else
+            echo "main already matches upstream plus local customizations."
+          fi

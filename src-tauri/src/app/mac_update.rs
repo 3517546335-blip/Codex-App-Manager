@@ -1,0 +1,2078 @@
+//! macOS update planning + staging service.
+//!
+//! Bridges the pure `codex-mac-engine` (detect + appcast + plan + download +
+//! verify) to the Tauri command surface.
+//!
+//! - `plan_macos_update`  — read-only: what would we download? (delta vs full)
+//! - `stage_macos_update` — download the artifact + size + EdDSA verify into a
+//!   staging dir. Non-destructive: it does NOT apply/swap. The destructive tail
+//!   (BinaryDelta apply → codesign gate → atomic swap → relaunch) comes next.
+//!
+//! `simulated_build` lets the UI preview the delta path even when the machine is
+//! already on the latest build (the user's case during development).
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use serde::Serialize;
+
+use codex_mac_engine::{
+    apply_delta, download, gate_reconstructed, plan_update, quit_codex_at, relaunch, rollback,
+    swap::codex_running_at, swap_in_place_with_observer, sys, verify_sparkle, Appcast,
+    NetworkConfig, SwapBoundary, UpdatePlan, UpdateStrategy,
+};
+
+use crate::app::disk;
+use crate::app::install_tx::{ActiveInstallTx, InstallTxKind};
+use crate::app::op_phase::OperationPhase;
+use crate::app::operation_outcome::{recovery, OperationOutcome, StepOutcome};
+#[cfg(target_os = "macos")]
+use crate::app::provenance::ManagedRecord;
+use crate::app::provenance::ProvenanceStore;
+use crate::app::staging::{self, StagingDir};
+use crate::errors::AppError;
+
+/// Optional hook for the command layer to publish operation phases (quit policy).
+pub type PhaseHook<'a> = dyn Fn(OperationPhase) + Send + Sync + 'a;
+
+const DITTO: &str = "/usr/bin/ditto";
+const OPEN: &str = "/usr/bin/open";
+const CANONICAL_BUNDLE_NAME: &str = "ChatGPT.app";
+#[cfg(target_os = "macos")]
+const LEGACY_BUNDLE_NAME: &str = "Codex.app";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledCodex {
+    pub path: String,
+    pub build: u64,
+    /// Human-facing version (`CFBundleShortVersionString`, e.g. 26.602.40724) —
+    /// what we display. `build` (CFBundleVersion) is the Sparkle comparison key.
+    pub short_version: String,
+    /// `arm64` / `x86_64` of the installed bundle (drives appcast selection).
+    pub arch: String,
+    /// Bundle file mtime as Unix seconds — when this build landed on disk
+    /// (install or in-place update). A reliable date when the feed lacks one.
+    pub installed_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacUpdateReport {
+    pub appcast_url: String,
+    pub installed: Option<InstalledCodex>,
+    pub simulated_build: Option<u64>,
+    pub plan: Option<UpdatePlan>,
+    /// `<pubDate>` of the appcast item matching the INSTALLED build — the true
+    /// release date of the running version, when the feed publishes it.
+    pub installed_pub_date: Option<String>,
+    /// `<pubDate>` of the latest appcast item — the release date of the update
+    /// target, when the feed publishes it.
+    pub latest_pub_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacStageReport {
+    pub up_to_date: bool,
+    pub strategy: String,
+    pub latest_build: u64,
+    pub latest_short_version: String,
+    pub download_size: u64,
+    pub full_size: u64,
+    pub savings_pct: f64,
+    pub staged_path: Option<String>,
+    /// EdDSA signature verified against the pinned Sparkle key.
+    pub verified: bool,
+}
+
+/// Architecture to plan against: the INSTALLED Codex's (so a delta applies to
+/// the right base bundle), falling back to the host arch when nothing's installed.
+fn arch_of(installed: &Option<InstalledCodex>) -> &str {
+    installed
+        .as_ref()
+        .map(|i| i.arch.as_str())
+        .unwrap_or(std::env::consts::ARCH)
+}
+
+/// Load the architecture-matched appcast synthesized from the embedded package.
+fn fetch_appcast_for_arch(
+    arch: &str,
+    _network: &NetworkConfig,
+) -> Result<(String, Appcast), AppError> {
+    crate::app::offline_bundle::mac_appcast(arch)
+}
+
+fn parse_macos_version(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+fn host_macos_version() -> Option<(u32, u32)> {
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_macos_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Reject staging/installing an update the host macOS is too old to run. If the
+/// requirement or host version can't be parsed, we don't block.
+fn require_os_supported(required: Option<&str>) -> Result<(), AppError> {
+    let (Some(req), Some(host)) = (required.and_then(parse_macos_version), host_macos_version())
+    else {
+        return Ok(());
+    };
+    if host >= req {
+        Ok(())
+    } else {
+        Err(AppError::Engine(format!(
+            "this macOS ({}.{}) is older than the latest Codex requires ({}.{}+)",
+            host.0, host.1, req.0, req.1
+        )))
+    }
+}
+
+fn effective_build(simulated_build: Option<u64>, installed: &Option<InstalledCodex>) -> u64 {
+    simulated_build
+        .or_else(|| installed.as_ref().map(|i| i.build))
+        .unwrap_or(0)
+}
+
+fn installed_from_path_build(path: String, build: u64) -> InstalledCodex {
+    let arch = sys::app_arch(&path).unwrap_or_else(|| std::env::consts::ARCH.to_string());
+    let short_version = sys::read_bundle_short_version(&path).unwrap_or_default();
+    // Bundle mtime -> when this build landed on disk (install / in-place swap).
+    let installed_at = std::fs::metadata(Path::new(&path))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    InstalledCodex {
+        path,
+        build,
+        short_version,
+        arch,
+        installed_at,
+    }
+}
+
+fn detect_installed() -> Option<InstalledCodex> {
+    sys::installed_codex_build().map(|(path, build)| installed_from_path_build(path, build))
+}
+
+#[cfg(target_os = "macos")]
+fn legacy_migration_target(record: &ManagedRecord) -> Option<(PathBuf, PathBuf, u64)> {
+    if record.source != "manager-installed" {
+        return None;
+    }
+    let legacy = PathBuf::from(&record.path);
+    if legacy.file_name().and_then(|name| name.to_str()) != Some(LEGACY_BUNDLE_NAME) {
+        return None;
+    }
+    let (_, build) = sys::installed_codex_build_at_path(&record.path)?;
+    if sys::read_bundle_executable(&record.path).as_deref() != Some("ChatGPT") {
+        return None;
+    }
+    let canonical = legacy.parent()?.join(CANONICAL_BUNDLE_NAME);
+    if canonical.exists()
+        || codex_running_at(&legacy)
+        || codex_mac_engine::swap::translocated_instance_running(&legacy)
+    {
+        return None;
+    }
+    Some((legacy, canonical, build))
+}
+
+/// Rename manager-installed post-rebrand bundles that older releases placed at
+/// `Codex.app`. The outer rename does not modify the signed bundle contents.
+/// Provenance is updated atomically; a failed store write rolls the rename back.
+#[cfg(target_os = "macos")]
+fn migrate_legacy_managed_install(store: &mut ProvenanceStore) -> Option<InstalledCodex> {
+    let candidate = store
+        .managed
+        .iter()
+        .rev()
+        .find_map(legacy_migration_target);
+    let (legacy, canonical, build) = candidate?;
+    log::info!(
+        "macOS migrating managed bundle path from={} to={}",
+        legacy.display(),
+        canonical.display()
+    );
+    if let Err(err) = std::fs::rename(&legacy, &canonical) {
+        log::warn!("macOS managed bundle migration skipped error={err}");
+        return None;
+    }
+
+    let old_path = legacy.to_string_lossy().into_owned();
+    let new_path = canonical.to_string_lossy().into_owned();
+    let mut updated = store.clone();
+    updated.remove(&old_path);
+    updated.record(new_path.clone(), build, "manager-installed");
+    if let Err(err) = updated.save() {
+        log::error!("macOS managed bundle migration provenance failed error={err}");
+        if let Err(rollback_err) = std::fs::rename(&canonical, &legacy) {
+            log::error!(
+                "macOS managed bundle migration rollback failed error={rollback_err}"
+            );
+        }
+        return None;
+    }
+    *store = updated;
+    Some(installed_from_path_build(new_path, build))
+}
+
+pub fn detect_existing_install_at_path(path: &Path) -> Result<InstalledCodex, AppError> {
+    if !path.exists() {
+        return Err(AppError::Internal(
+            "所选位置不存在，请选择已安装的 Codex 应用".to_string(),
+        ));
+    }
+    if !path.is_dir() {
+        return Err(AppError::Internal(
+            "所选位置必须是应用包（.app）".to_string(),
+        ));
+    }
+    // Identity, not name: after the upstream ChatGPT-brand merge the Codex
+    // bundle may be named ChatGPT.app, while /Applications/ChatGPT.app can just
+    // as well be ChatGPT Classic. Only CFBundleIdentifier can tell them apart.
+    if path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+        return Err(AppError::Internal(
+            "请选择 Codex 应用本体（.app），而不是它的上级文件夹".to_string(),
+        ));
+    }
+    let raw = path.to_string_lossy();
+    match sys::read_bundle_identifier(&raw).as_deref() {
+        Some(sys::CODEX_BUNDLE_ID) => {}
+        Some("com.openai.chat") => {
+            return Err(AppError::Internal(
+                "所选应用是 ChatGPT Classic（com.openai.chat），不是 Codex；本工具只管理 Codex"
+                    .to_string(),
+            ));
+        }
+        Some(other) => {
+            return Err(AppError::Internal(format!(
+                "所选应用不是 Codex（CFBundleIdentifier 为 {other}，期望 {}）",
+                sys::CODEX_BUNDLE_ID
+            )));
+        }
+        None => {
+            return Err(AppError::Internal(
+                "无法读取所选应用的 CFBundleIdentifier，请选择已安装的 Codex 应用".to_string(),
+            ));
+        }
+    }
+    require_not_translocation_risk(&raw)?;
+    let (detected_path, build) = sys::installed_codex_build_at_path(&raw)
+        .ok_or_else(|| AppError::Internal("无法读取所选 Codex 应用的版本信息".to_string()))?;
+    Ok(installed_from_path_build(detected_path, build))
+}
+
+/// Refuse paths macOS would run through App Translocation: the live process
+/// then sits on a randomized mount, every path-scoped run/quit protection is
+/// blind to it, and a swap/uninstall could act while the app is running.
+/// Checked at adoption AND re-checked right before each destructive tail
+/// (the attribute can appear later, e.g. after a re-download over the path).
+fn require_not_translocation_risk(app: &str) -> Result<(), AppError> {
+    if sys::is_translocation_risk(app) {
+        return Err(AppError::Internal(
+            "该应用带有会触发 App Translocation 的 macOS 隔离属性：系统会在随机路径运行它，\
+             无法安全地检测或退出运行中的实例。请先退出该应用，再用 Finder 将它「移动」到\
+             其他位置再移回（移动会写入豁免标记），或运行 xattr -d com.apple.quarantine \
+             移除隔离属性后重试"
+                .to_string(),
+        ));
+    }
+    // De-quarantining does not migrate an ALREADY-RUNNING translocated
+    // instance back — it stays on its randomized mount, invisible to the
+    // path-scoped quit check. Refuse until it exits. (Bundle-name matching may
+    // also catch a translocated ChatGPT Classic; quitting it too is a harmless
+    // ask compared to swapping under a live process.)
+    if codex_mac_engine::swap::translocated_instance_running(Path::new(app)) {
+        return Err(AppError::Internal(
+            "检测到该应用（或同名应用）仍有一个经 App Translocation 启动的实例在运行：\
+             它不会随隔离属性的清除而迁回原路径，无法被安全退出。请先退出该应用后重试"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn detect_managed_installed() -> Option<InstalledCodex> {
+    let store = ProvenanceStore::load();
+    #[cfg(target_os = "macos")]
+    let store = {
+        let mut store = store;
+        if let Some(installed) = migrate_legacy_managed_install(&mut store) {
+            return Some(installed);
+        }
+        store
+    };
+    for record in store.managed.iter().rev() {
+        if let Some((path, build)) = sys::installed_codex_build_at_path(&record.path) {
+            if store.is_managed_build(&path, build) {
+                return Some(installed_from_path_build(path, build));
+            }
+        }
+    }
+    detect_installed()
+}
+
+pub fn plan_macos_update(simulated_build: Option<u64>) -> Result<MacUpdateReport, AppError> {
+    plan_macos_update_with_network(simulated_build, &NetworkConfig::system())
+}
+
+pub fn plan_macos_update_with_network(
+    simulated_build: Option<u64>,
+    network: &NetworkConfig,
+) -> Result<MacUpdateReport, AppError> {
+    log::info!("macOS plan start simulated_build={simulated_build:?}");
+    let installed = detect_managed_installed();
+    let (appcast_url, appcast) = fetch_appcast_for_arch(arch_of(&installed), network)?;
+    let plan = plan_update(&appcast, effective_build(simulated_build, &installed));
+
+    let latest = appcast.latest();
+    if let Some(latest) = latest {
+        require_os_supported(latest.minimum_system_version.as_deref())?;
+    }
+    let latest_pub_date = latest.and_then(|latest| latest.pub_date.clone());
+
+    // Release date of the *installed* build (its own appcast item), so it stays
+    // correct even when a newer version is available. None when the feed omits
+    // pubDate or the installed build has aged out of the feed.
+    let installed_pub_date = installed.as_ref().and_then(|inst| {
+        appcast
+            .items
+            .iter()
+            .find(|it| it.build == inst.build)
+            .and_then(|it| it.pub_date.clone())
+    });
+
+    let report = MacUpdateReport {
+        appcast_url,
+        installed,
+        simulated_build,
+        plan,
+        installed_pub_date,
+        latest_pub_date,
+    };
+    let installed_build = report.installed.as_ref().map(|installed| installed.build);
+    let latest_build = report.plan.as_ref().map(|plan| plan.latest_build);
+    let strategy = report
+        .plan
+        .as_ref()
+        .map(|plan| strategy_label(&plan.strategy))
+        .unwrap_or_else(|| "none".to_string());
+    log::info!(
+        "macOS plan complete installed_build={installed_build:?} latest_build={latest_build:?} strategy={strategy}"
+    );
+    Ok(report)
+}
+
+fn strategy_label(strategy: &UpdateStrategy) -> String {
+    match strategy {
+        UpdateStrategy::Delta { from_build } => format!("delta-from-{from_build}"),
+        UpdateStrategy::Full => "full".to_string(),
+    }
+}
+
+/// Worst-case temporary disk budget for one macOS update. Even a delta plan may
+/// fall back to the full package, and `ditto` extraction can briefly occupy
+/// several times the zip size, so the budget uses the full archive as the
+/// conservative basis.
+fn mac_space_budget(plan: &UpdatePlan) -> u64 {
+    const HEADROOM: u64 = 512 * 1024 * 1024;
+    plan.download_size
+        .saturating_add(plan.full_size.saturating_mul(3))
+        .saturating_add(HEADROOM)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.0} MiB", bytes as f64 / MIB)
+    }
+}
+
+fn preflight_mac_disk(plan: &UpdatePlan) -> Result<(), AppError> {
+    preflight_mac_disk_with_available(plan, disk::available_space)
+}
+
+fn preflight_mac_disk_with_available<F>(plan: &UpdatePlan, available: F) -> Result<(), AppError>
+where
+    F: Fn(&Path) -> Result<Option<u64>, AppError>,
+{
+    let staging = staging::staging_root();
+    let need = mac_space_budget(plan);
+    if let Some(free) = available(&staging)? {
+        if free < need {
+            return Err(AppError::Engine(format!(
+                "磁盘可用空间不足：本次更新约需 {}，当前可用 {}。请清理后重试",
+                human_bytes(need),
+                human_bytes(free)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Download an artifact `(url, size, signature)` into staging, size-gate it, and
+/// verify its EdDSA signature against the pinned Sparkle key. Idempotent: reuses
+/// an already-staged file of the right size. On EdDSA failure the staged file is
+/// dropped so a retry re-downloads instead of trusting a corrupt same-size
+/// cache. Returns the verified staged path. Shared by `stage` (non-destructive)
+/// and `perform` (the full install), so the destructive path can never skip the
+/// pinned-key check. Taking explicit fields (rather than a plan) lets `perform`
+/// download the full enclosure when it falls back from a delta.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: u64,
+    /// Host the bytes are coming from, e.g. `codexapp.agentsmirror.com`.
+    pub source: String,
+}
+
+/// Host portion of a URL, for showing the user which source is downloading.
+fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// No-op progress sink for downloads whose progress isn't surfaced (e.g. stage).
+fn no_progress(_p: DownloadProgress) {}
+
+/// Graceful quit with a user-actionable failure message. Codex often answers
+/// the quit event with its own confirmation dialog ("Quit Codex?" when
+/// automations are enabled); the engine brings that dialog frontmost after a
+/// grace period, and if the user still hasn't confirmed by the timeout we say
+/// exactly what to click instead of a bare timeout. Never force-kills.
+fn quit_codex_gracefully(install_app: &Path) -> Result<(), AppError> {
+    quit_codex_at(install_app, 30).map_err(|_| {
+        AppError::Engine(
+            "Codex 未在限时内退出——它可能正在等待退出确认（如「Quit Codex?」对话框，已尝试将其带到前台）。\
+             请在 Codex 中确认退出后重试；为保护进行中的会话，不会强制结束 Codex"
+                .to_string(),
+        )
+    })
+}
+
+fn download_and_verify(
+    url: &str,
+    size: u64,
+    max_size: u64,
+    signature: &str,
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+) -> Result<PathBuf, AppError> {
+    let source = host_of(url);
+    log::info!("macOS download and verify start source={source}");
+    if size > max_size {
+        return Err(AppError::Engine(format!(
+            "artifact size {size} exceeds {max_size} byte limit"
+        )));
+    }
+    let file_name = url.rsplit('/').next().unwrap_or("payload.bin");
+    // Download into the PERSISTENT cache (not a per-run staging dir): a paused
+    // `.part` survives here, so the next perform/install resumes it instead of
+    // restarting at 0. The artifact is consumed (verified → unpacked/applied)
+    // from here; success clears the cache (see perform/install tails).
+    let dest = staging::download_cache_path(url, file_name)?;
+    let source = host_of(url);
+
+    let already = std::fs::metadata(&dest)
+        .map(|m| m.len() == size)
+        .unwrap_or(false);
+    if already {
+        // Cached from a prior stage — report complete so the UI doesn't sit at 0.
+        progress(DownloadProgress {
+            downloaded: size,
+            total: size,
+            source,
+        });
+    } else {
+        download::download_to_with_progress_bounded_with_network(
+            url,
+            &dest,
+            max_size,
+            &|downloaded| {
+                progress(DownloadProgress {
+                    downloaded,
+                    total: size,
+                    source: source.clone(),
+                });
+            },
+            network,
+        )
+        .map_err(|e| AppError::Engine(e.to_string()))?;
+    }
+
+    let len = std::fs::metadata(&dest)
+        .map_err(|e| AppError::Engine(e.to_string()))?
+        .len();
+    if len != size {
+        let err = AppError::Engine(format!("size mismatch: {len} != {size}"));
+        log::error!("macOS download and verify failed error={err}");
+        return Err(err);
+    }
+    if len > max_size {
+        let err = AppError::Engine(format!("artifact size {len} exceeds {max_size} byte limit"));
+        log::error!("macOS download and verify failed error={err}");
+        return Err(err);
+    }
+
+    let bytes = download::read_file(&dest).map_err(|e| AppError::Engine(e.to_string()))?;
+    if let Err(err) = verify_sparkle(&bytes, signature) {
+        let _ = std::fs::remove_file(&dest);
+        let err = AppError::Engine(err.to_string());
+        log::error!("macOS download and verify failed error={err}");
+        return Err(err);
+    }
+
+    let path = dest.display();
+    log::info!("macOS download and verify complete path={path}");
+    Ok(dest)
+}
+
+fn max_bytes_for_strategy(strategy: &UpdateStrategy) -> u64 {
+    match strategy {
+        UpdateStrategy::Delta { .. } => codex_mac_engine::limits::MAX_DELTA_BYTES,
+        UpdateStrategy::Full => codex_mac_engine::limits::MAX_PACKAGE_BYTES,
+    }
+}
+
+pub fn stage_macos_update(simulated_build: Option<u64>) -> Result<MacStageReport, AppError> {
+    stage_macos_update_with_network(simulated_build, &NetworkConfig::system())
+}
+
+pub fn stage_macos_update_with_network(
+    simulated_build: Option<u64>,
+    network: &NetworkConfig,
+) -> Result<MacStageReport, AppError> {
+    log::info!("macOS stage start simulated_build={simulated_build:?}");
+    // A standalone stage can also be cancelled (its download sets the abort
+    // latch). Own a guard so a cancelled stage can't leave the latch set and
+    // make the NEXT perform/install abort itself at its first checkpoint.
+    let _abort_guard = AbortGuard::new();
+    let installed = detect_managed_installed();
+    let (_, appcast) = fetch_appcast_for_arch(arch_of(&installed), network)?;
+    let plan = plan_update(&appcast, effective_build(simulated_build, &installed))
+        .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+
+    if plan.up_to_date {
+        log::info!(
+            "macOS stage complete build={} verified=false",
+            plan.latest_build
+        );
+        return Ok(MacStageReport {
+            up_to_date: true,
+            strategy: "none".to_string(),
+            latest_build: plan.latest_build,
+            latest_short_version: plan.latest_short_version,
+            download_size: 0,
+            full_size: plan.full_size,
+            savings_pct: 0.0,
+            staged_path: None,
+            verified: false,
+        });
+    }
+
+    if let Some(latest) = appcast.latest() {
+        require_os_supported(latest.minimum_system_version.as_deref())?;
+    }
+    preflight_mac_disk(&plan)?;
+
+    let signature = plan
+        .ed_signature
+        .clone()
+        .ok_or_else(|| AppError::Engine("appcast enclosure missing edSignature".to_string()))?;
+    // Stages straight into the persistent download cache — no per-run staging dir
+    // to discard, so a paused partial survives for the next resume.
+    let dest = match download_and_verify(
+        &plan.download_url,
+        plan.download_size,
+        max_bytes_for_strategy(&plan.strategy),
+        &signature,
+        &no_progress,
+        network,
+    ) {
+        Ok(dest) => dest,
+        Err(err) => {
+            log::error!("macOS stage failed error={err}");
+            return Err(err);
+        }
+    };
+
+    let report = MacStageReport {
+        up_to_date: false,
+        strategy: strategy_label(&plan.strategy),
+        latest_build: plan.latest_build,
+        latest_short_version: plan.latest_short_version,
+        download_size: plan.download_size,
+        full_size: plan.full_size,
+        savings_pct: plan.savings_pct,
+        staged_path: Some(dest.to_string_lossy().into_owned()),
+        verified: true,
+    };
+    let build = report.latest_build;
+    let verified = report.verified;
+    log::info!("macOS stage complete build={build} verified={verified}");
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacPerformReport {
+    pub up_to_date: bool,
+    pub from_build: u64,
+    pub to_build: u64,
+    pub strategy: String,
+    pub installed_path: String,
+    /// EdDSA (download) + codesign/Team/Gatekeeper (reconstructed bundle) passed.
+    pub verified: bool,
+    /// The new version was relaunched (only when Codex had been running).
+    pub relaunched: bool,
+    /// Codex WAS running but the relaunch failed — the user must start it
+    /// manually. Distinct from a plain `!relaunched`, which also covers the
+    /// clean case where Codex simply wasn't running (no action needed).
+    pub relaunch_failed: bool,
+    /// The post-swap health check failed and we restored the previous bundle.
+    pub rolled_back: bool,
+    /// A non-fatal warning to surface alongside an otherwise *successful* update
+    /// — e.g. the provenance record couldn't be saved (the install will keep
+    /// being seen as external), or where the previous bundle's backup was kept
+    /// after a relaunch failure. None on a fully clean update.
+    pub warning: Option<String>,
+    pub message: String,
+}
+
+/// What the user saw + consented to at stage/confirm time. `perform` re-checks
+/// reality against this BEFORE the destructive swap, so a Codex self-update, a
+/// moved install, or an appcast that advanced between confirm and execute can't
+/// silently redirect the swap to a target the user never approved.
+#[derive(Debug, Clone)]
+pub struct PerformExpectation {
+    pub from_build: u64,
+    pub to_build: u64,
+    pub install_path: String,
+}
+
+/// Unpack a Sparkle macOS full-update `.zip` and surface the `.app` inside it.
+/// `ditto -x -k` is used (not `unzip`) because it preserves the extended
+/// attributes and resource metadata a code signature depends on, so the
+/// extracted bundle still passes `codesign`/Gatekeeper. The found bundle is
+/// moved to `out_app` (both live under the same-volume `work` dir).
+fn unpack_app_zip(zip: &Path, work: &Path, out_app: &Path) -> Result<(), AppError> {
+    let extract = work.join("unzip");
+    let _ = std::fs::remove_dir_all(&extract);
+    std::fs::create_dir_all(&extract).map_err(|e| AppError::Engine(format!("mkdir unzip: {e}")))?;
+
+    let status = std::process::Command::new(DITTO)
+        .args(["-x", "-k"])
+        .arg(zip)
+        .arg(&extract)
+        .status()
+        .map_err(|e| AppError::Engine(format!("spawn ditto: {e}")))?;
+    if !status.success() {
+        return Err(AppError::Engine(format!(
+            "ditto unzip exited with {status}"
+        )));
+    }
+
+    // The upstream archive may ship the bundle under either name (Codex.app
+    // pre-merge, ChatGPT.app post-merge); identity is checked, and the rename
+    // below normalizes whatever we accepted to the caller's canonical out_app.
+    let found = require_single_codex_app(&extract)?;
+    if out_app.exists() {
+        let _ = std::fs::remove_dir_all(out_app);
+    }
+    std::fs::rename(&found, out_app)
+        .map_err(|e| AppError::Engine(format!("move unpacked app: {e}")))?;
+    Ok(())
+}
+
+fn require_single_codex_app(dir: &Path) -> Result<PathBuf, AppError> {
+    let mut apps = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| AppError::Engine(format!("read unzip: {e}")))? {
+        let path = entry
+            .map_err(|e| AppError::Engine(format!("read unzip entry: {e}")))?
+            .path();
+        if path.is_dir() && path.extension().map(|x| x == "app").unwrap_or(false) {
+            apps.push(path);
+        }
+    }
+    if apps.is_empty() {
+        return Err(AppError::Engine(
+            "full-update zip did not contain an .app bundle".to_string(),
+        ));
+    }
+    if apps.len() > 1 {
+        return Err(AppError::Engine(
+            "full-update zip contained multiple .app bundles; refusing to guess".to_string(),
+        ));
+    }
+    let app = apps.remove(0);
+    // Accept any top-level bundle name but require the Codex product identity —
+    // the codesign gate re-asserts this against the sealed plist right after.
+    match sys::read_bundle_identifier(&app.to_string_lossy()).as_deref() {
+        Some(sys::CODEX_BUNDLE_ID) => Ok(app),
+        Some(other) => Err(AppError::Engine(format!(
+            "full-update zip contained a non-Codex .app bundle (CFBundleIdentifier {other}, expected {})",
+            sys::CODEX_BUNDLE_ID
+        ))),
+        None => Err(AppError::Engine(
+            "full-update zip's .app bundle had no readable CFBundleIdentifier".to_string(),
+        )),
+    }
+}
+
+/// Download the appcast's full enclosure (size + EdDSA verified) and unpack it
+/// into `out_app`. Needs no BinaryDelta — used both as the primary full path and
+/// as the recovery when a delta is unavailable or fails to apply.
+fn reconstruct_full(
+    appcast: &Appcast,
+    work: &Path,
+    out_app: &Path,
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+) -> Result<(), AppError> {
+    let latest = appcast
+        .latest()
+        .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+    let sig = latest.full.ed_signature.clone().ok_or_else(|| {
+        AppError::Engine("appcast full enclosure missing edSignature".to_string())
+    })?;
+    let staged = download_and_verify(
+        &latest.full.url,
+        latest.full.length,
+        codex_mac_engine::limits::MAX_PACKAGE_BYTES,
+        &sig,
+        progress,
+        network,
+    )?;
+    unpack_app_zip(&staged, work, out_app)
+}
+
+/// **Destructive**: download → verify → reconstruct → gate → quit → atomic swap
+/// → health-check → relaunch (or rollback). Always operates on the REAL installed
+/// build (no `simulated_build` — a delta only applies to the true basis bundle).
+///
+/// Ordering minimizes downtime and maximizes safety:
+///   1. download the artifact and verify its EdDSA signature (pinned key);
+///   2. reconstruct the new bundle in same-volume staging (delta apply, or unzip
+///      a full update) — Codex may stay running; the basis is only read;
+///   3. gate the reconstructed bundle (codesign/Team=OpenAI/Gatekeeper) BEFORE it
+///      goes anywhere near the install root — a compromised mirror cannot forge
+///      Apple's Developer ID signature;
+///   4. ask Codex to quit gracefully (never force-kill — protects in-flight work);
+///      if it refuses we abort with the install root untouched;
+///   5. same-volume atomic `rename` swap, keeping the old bundle as a backup;
+///   6. filesystem health check (installed build == target && still gated). On
+///      success drop the backup, record managed provenance, relaunch the new
+///      version (only if Codex had been running). On failure roll back to the
+///      preserved old bundle and relaunch it.
+///
+/// `binary_delta` is the optional path to the vendored Sparkle `BinaryDelta`
+/// tool, resolved by the command layer (it owns the Tauri resource resolver).
+/// It is only required for the delta branch; a full-package update ignores it,
+/// so `None` is fine unless an actual delta needs reconstructing.
+pub fn perform_macos_update(
+    binary_delta: Option<PathBuf>,
+    expected: PerformExpectation,
+    progress: &dyn Fn(DownloadProgress),
+) -> Result<MacPerformReport, AppError> {
+    perform_macos_update_with_network(binary_delta, expected, progress, &NetworkConfig::system())
+}
+
+pub fn perform_macos_update_with_network(
+    binary_delta: Option<PathBuf>,
+    expected: PerformExpectation,
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+) -> Result<MacPerformReport, AppError> {
+    perform_macos_update_with_network_and_phase(
+        binary_delta,
+        expected,
+        progress,
+        network,
+        None,
+    )
+}
+
+pub fn perform_macos_update_with_network_and_phase(
+    binary_delta: Option<PathBuf>,
+    expected: PerformExpectation,
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+    phase: Option<&PhaseHook<'_>>,
+) -> Result<MacPerformReport, AppError> {
+    let set_phase = |p: OperationPhase| {
+        if let Some(hook) = phase {
+            hook(p);
+        }
+    };
+    // Reset the latch when THIS op ends (not at entry) so a cancel racing the
+    // op's startup isn't wiped. See AbortGuard.
+    let _abort_guard = AbortGuard::new();
+    set_phase(OperationPhase::Preparing);
+    // A vanished install is itself a stale snapshot: the user confirmed an
+    // update against a Codex that is no longer there (deleted / moved between
+    // confirm and execute). Route it through StaleExpectation so the UI
+    // auto-re-checks (→ none/install) instead of looping on a dead error.
+    let installed = detect_managed_installed().ok_or_else(|| {
+        AppError::StaleExpectation(
+            "未检测到 Codex（可能已被删除或移动）：请重新检查后再试".to_string(),
+        )
+    })?;
+    log::info!(
+        "macOS perform start from_build={} to_build={} path={}",
+        expected.from_build,
+        expected.to_build,
+        expected.install_path
+    );
+
+    // Consent integrity: the destructive swap must target exactly what the user
+    // saw + confirmed. If Codex self-updated (Sparkle), moved, or staging is
+    // stale, refuse rather than act on a stale consent.
+    if installed.path != expected.install_path {
+        let actual = &installed.path;
+        log::warn!(
+            "macOS perform stale expectation expected_from={} expected_to={} actual_path={actual}",
+            expected.from_build,
+            expected.to_build
+        );
+        return Err(AppError::StaleExpectation(format!(
+            "安装位置已变化（确认时 {}，现在 {}）：请重新检查后再试",
+            expected.install_path, installed.path
+        )));
+    }
+    if installed.build != expected.from_build {
+        let actual = installed.build;
+        log::warn!(
+            "macOS perform stale expectation expected_from={} expected_to={} actual_build={actual}",
+            expected.from_build,
+            expected.to_build
+        );
+        return Err(AppError::StaleExpectation(format!(
+            "已装版本已变化（确认时 build {}，现在 build {}）：请重新检查后再试",
+            expected.from_build, installed.build
+        )));
+    }
+
+    let install_path = PathBuf::from(&installed.path);
+
+    let (_, appcast) = fetch_appcast_for_arch(&installed.arch, network)?;
+    let plan = plan_update(&appcast, installed.build)
+        .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+    // The appcast fetch is the slow part of "正在准备" — honor a cancel here,
+    // before the up-to-date / stale early-returns and the destructive work below.
+    check_update_abort()?;
+
+    // The appcast must still point at the build the user confirmed.
+    if plan.latest_build != expected.to_build {
+        let actual = plan.latest_build;
+        log::warn!(
+            "macOS perform stale expectation expected_from={} expected_to={} actual_target={actual}",
+            expected.from_build,
+            expected.to_build
+        );
+        return Err(AppError::StaleExpectation(format!(
+            "更新目标已变化（确认时 build {}，现在 build {}）：请重新检查后再试",
+            expected.to_build, plan.latest_build
+        )));
+    }
+
+    if plan.up_to_date {
+        return Ok(MacPerformReport {
+            up_to_date: true,
+            from_build: installed.build,
+            to_build: plan.latest_build,
+            strategy: "none".to_string(),
+            installed_path: installed.path,
+            verified: false,
+            relaunched: false,
+            relaunch_failed: false,
+            rolled_back: false,
+            warning: None,
+            message: format!("已是最新 (build {})", plan.latest_build),
+        });
+    }
+
+    if let Some(latest) = appcast.latest() {
+        require_os_supported(latest.minimum_system_version.as_deref())?;
+    }
+    preflight_mac_disk(&plan)?;
+    // Last cancel checkpoint before the download begins: the preparing phase
+    // (appcast fetch → plan → preflight) is done; once curl starts, the download
+    // loop's own cancel flag takes over. A cancel pressed during "正在准备"
+    // lands here and bails before any destructive prep.
+    check_update_abort()?;
+    set_phase(OperationPhase::Downloading);
+
+    // 1) Set up same-volume staging for the reconstructed bundle + backup.
+    let staging = staging::create_unique_staging("update")?;
+    let work = staging.path().to_path_buf();
+    let out_app = work.join(CANONICAL_BUNDLE_NAME);
+    let backup = work.join("backup-ChatGPT.app");
+    let _ = std::fs::remove_dir_all(&out_app);
+    let _ = std::fs::remove_dir_all(&backup);
+    let mut keep_staging = false;
+    let perform_result = (|| -> Result<MacPerformReport, AppError> {
+        // 2) Reconstruct the new bundle into out_app. Prefer a delta when the tool is
+        //    present; fall back to the appcast's full package when the tool is missing
+        //    OR the delta fails to apply (modified basis, tool/patch version mismatch,
+        //    …). The full enclosure is always present in the same appcast entry and
+        //    needs no tool, so a recoverable delta failure no longer fails the update.
+        let want_delta = matches!(plan.strategy, UpdateStrategy::Delta { .. });
+        let effective_strategy = if want_delta {
+            if let Some(tool) = binary_delta.as_deref() {
+                let sig = plan.ed_signature.clone().ok_or_else(|| {
+                    AppError::Engine("appcast delta missing edSignature".to_string())
+                })?;
+                let staged = download_and_verify(
+                    &plan.download_url,
+                    plan.download_size,
+                    codex_mac_engine::limits::MAX_DELTA_BYTES,
+                    &sig,
+                    progress,
+                    network,
+                )?;
+                set_phase(OperationPhase::Applying);
+                match apply_delta(tool, &install_path, &out_app, &staged) {
+                    Ok(()) => strategy_label(&plan.strategy),
+                    Err(delta_err) => {
+                        reconstruct_full(&appcast, &work, &out_app, progress, network)?;
+                        format!("full (delta 应用失败回退: {delta_err})")
+                    }
+                }
+            } else {
+                set_phase(OperationPhase::Applying);
+                reconstruct_full(&appcast, &work, &out_app, progress, network)?;
+                "full (delta 工具缺失，回退全量)".to_string()
+            }
+        } else {
+            set_phase(OperationPhase::Applying);
+            reconstruct_full(&appcast, &work, &out_app, progress, network)?;
+            "full".to_string()
+        };
+
+        // 3) gate the reconstructed bundle before it touches the install root.
+        set_phase(OperationPhase::Verifying);
+        log::info!("macOS perform step=gate");
+        gate_reconstructed(&out_app)
+            .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝替换）: {e}")))?;
+
+        // 4a) pre-flight the atomic-swap precondition BEFORE quitting Codex, so a
+        //     cross-volume staging dir fails fast WITHOUT closing the user's app.
+        let install_parent = install_path.parent().unwrap_or(install_path.as_path());
+        log::info!("macOS perform step=same-volume-preflight");
+        if !codex_mac_engine::swap::same_volume(&out_app, install_parent) {
+            log::warn!("macOS perform same-volume preflight failed");
+            return Err(AppError::Engine(
+                "暂存目录与安装根不在同一卷，无法原子替换：请确保 TMPDIR 与安装根同卷".to_string(),
+            ));
+        }
+
+        // Honor a cancel before touching the user's running Codex. A second,
+        // phase-linearized checkpoint immediately before the swap closes the
+        // later quit/cancel window.
+        check_update_abort()?;
+
+        // Re-verify the TARGET right before the destructive tail: the early
+        // consent check ran before download, and the bundle at this path may
+        // have been swapped in the meantime — e.g. replaced with a ChatGPT
+        // Classic, which the identity gate inside installed_codex_build_at_path
+        // rejects. Quitting/swapping whatever sits here now would destroy
+        // something the user never confirmed.
+        match sys::installed_codex_build_at_path(&installed.path) {
+            Some((_, build)) if build == expected.from_build => {}
+            Some((_, build)) => {
+                return Err(AppError::StaleExpectation(format!(
+                    "安装目标在确认后发生了变化（当前 build {build}，确认时为 {}）：请重新检查后再试",
+                    expected.from_build
+                )));
+            }
+            None => {
+                return Err(AppError::StaleExpectation(
+                    "安装目标在确认后被移除或替换为非 Codex 应用：请重新检查后再试".to_string(),
+                ));
+            }
+        }
+        // The attribute can appear after adoption (e.g. the path was replaced
+        // by a fresh download) — a translocated live instance would be
+        // invisible to the quit check below.
+        require_not_translocation_risk(&installed.path)?;
+
+        // 4b) graceful quit (never force-kill), then 5) atomic same-volume swap. If
+        //     the swap fails after the quit, swap_in_place has restored the old
+        //     bundle in place — bring the user's app back before surfacing the error.
+        let was_running = codex_running_at(&install_path);
+        log::info!("macOS perform step=quit");
+        quit_codex_gracefully(&install_path)?;
+        log::info!("macOS perform step=swap");
+        set_phase(OperationPhase::Committing);
+        // The phase transition and the app quit preparation share the operation
+        // mutex. If quit won first its latch is now visible; if commit won first,
+        // quit was blocked. No destructive rename occurs between those outcomes.
+        if let Err(err) = check_update_abort() {
+            if was_running {
+                let _ = relaunch(&install_path);
+            }
+            return Err(err);
+        }
+        let had_previous = install_path.exists();
+        let mut tx = ActiveInstallTx::begin(
+            InstallTxKind::MacosSwap,
+            &install_path,
+            &out_app,
+            &backup,
+            had_previous,
+            Some(was_running),
+        )?;
+        let mut observer = |boundary: SwapBoundary| -> Result<(), codex_mac_engine::EngineError> {
+            match boundary {
+                SwapBoundary::BeforeMoveOld => Ok(()),
+                SwapBoundary::AfterMoveOld => tx
+                    .mark_old_moved()
+                    .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string())),
+                SwapBoundary::BeforeMoveNew => Ok(()),
+                SwapBoundary::AfterMoveNew => tx
+                    .mark_new_installed()
+                    .map_err(|e| codex_mac_engine::EngineError::Io(e.to_string())),
+            }
+        };
+        if let Err(err) =
+            swap_in_place_with_observer(&install_path, &out_app, &backup, &mut observer)
+        {
+            // In-process failure may have rolled back; if still mid-window the
+            // Drop of ActiveInstallTx keeps the log for startup recovery.
+            if was_running {
+                let _ = relaunch(&install_path);
+            }
+            log::error!("macOS perform swap failed error={err}");
+            return Err(AppError::Engine(err.to_string()));
+        }
+        // Keep the transaction log through post-swap health / rollback — never
+        // complete() until that tail settles.
+        set_phase(OperationPhase::Finishing);
+
+        // 6) filesystem health check on the installed root.
+        log::info!("macOS perform step=health");
+        let healthy = sys::installed_codex_build_at_path(&installed.path)
+            .map(|(_, build)| build == plan.latest_build)
+            .unwrap_or(false)
+            && gate_reconstructed(&install_path).is_ok();
+
+        if healthy {
+            // The new bundle is authentic + correct-version; record provenance. If
+            // the store can't be written (disk full / unwritable data dir), the
+            // update still succeeded — but surface it, since status would otherwise
+            // keep classifying this now-manager install as "external".
+            let mut store = ProvenanceStore::load();
+            store.record(
+                installed.path.clone(),
+                plan.latest_build,
+                "manager-installed",
+            );
+            let save_warning = match store.save() {
+                Ok(()) => None,
+                Err(e) => Some(format!("托管记录保存失败（{e}），安装暂仍会被识别为外部")),
+            };
+
+            if was_running {
+                // Relaunch BEFORE discarding the backup: if `open` fails we keep the
+                // backup as a recovery path instead of claiming a clean success. We
+                // do NOT downgrade a healthy, gated install just because auto-launch
+                // failed — the user can launch it manually.
+                log::info!("macOS perform step=relaunch");
+                if let Err(err) = relaunch(&install_path) {
+                    keep_staging = true;
+                    // Leave NewInstalled log + backup for recovery / manual use.
+                    tx.leave_pending();
+                    return Ok(MacPerformReport {
+                        up_to_date: false,
+                        from_build: installed.build,
+                        to_build: plan.latest_build,
+                        strategy: effective_strategy.clone(),
+                        installed_path: installed.path.clone(),
+                        verified: true,
+                        relaunched: false,
+                        relaunch_failed: true,
+                        rolled_back: false,
+                        warning: Some(match &save_warning {
+                            Some(note) => format!("旧版本备份暂留于 {}；{note}", backup.display()),
+                            None => format!("旧版本备份暂留于 {}", backup.display()),
+                        }),
+                        message: format!(
+                            "已替换为 build {}，但自动重启失败（{err}）：请手动启动 Codex",
+                            plan.latest_build
+                        ),
+                    });
+                }
+            }
+
+            // Not running, or relaunched cleanly → the backup is no longer needed.
+            let _ = std::fs::remove_dir_all(&backup);
+            tx.succeed()?;
+            let report = MacPerformReport {
+                up_to_date: false,
+                from_build: installed.build,
+                to_build: plan.latest_build,
+                strategy: effective_strategy.clone(),
+                installed_path: installed.path.clone(),
+                verified: true,
+                relaunched: was_running,
+                relaunch_failed: false,
+                rolled_back: false,
+                warning: save_warning,
+                message: format!("已更新 build {} → {}", installed.build, plan.latest_build),
+            };
+            log::info!(
+                "macOS perform success relaunched={} to_build={}",
+                report.relaunched,
+                report.to_build
+            );
+            Ok(report)
+        } else {
+            log::warn!("macOS perform step=rollback");
+            match rollback(&install_path, &backup) {
+                Ok(()) => {
+                    tx.mark_rolled_back()?;
+                }
+                Err(e) => {
+                    // Leave NewInstalled log + materials for manual recovery.
+                    tx.leave_pending();
+                    return Err(AppError::Engine(format!("回滚失败（需人工介入）: {e}")));
+                }
+            }
+            let relaunched = was_running && relaunch(&install_path).is_ok();
+            Ok(MacPerformReport {
+                up_to_date: false,
+                from_build: installed.build,
+                to_build: plan.latest_build,
+                strategy: effective_strategy.clone(),
+                installed_path: installed.path.clone(),
+                verified: true,
+                relaunched,
+                relaunch_failed: false,
+                rolled_back: true,
+                warning: None,
+                message: "新版本健康检查未通过，已回滚到旧版本".to_string(),
+            })
+        }
+    })();
+    match perform_result {
+        Ok(report) => {
+            if keep_staging {
+                let _ = staging.keep();
+            } else {
+                staging.discard();
+            }
+            // The artifact was downloaded, verified, and consumed — drop it so a
+            // later run re-downloads fresh. A FAILED run leaves the cache intact
+            // (the Err arm) so a paused/interrupted download can still resume.
+            // Best-effort: a stale artifact left behind is reclaimed by the stale
+            // cache sweep, so a cleanup failure must not fail a successful update.
+            let _ = staging::clear_download_cache();
+            Ok(report)
+        }
+        Err(err) => {
+            log::error!("macOS perform failed error={err} rolled_back=false");
+            staging.discard();
+            Err(err)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacInstallStatus {
+    pub installed: Option<InstalledCodex>,
+    /// "managed" | "external" | "none"
+    pub status: String,
+    /// All Codex-lineage installs when more than one exists (e.g. an old
+    /// `Codex.app` plus a hand-dragged post-rebrand `ChatGPT.app`). The UI
+    /// should surface this and have the user adopt one explicitly; destructive
+    /// operations stay safe regardless (they re-verify path + build + identity).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambiguous_paths: Option<Vec<String>>,
+    /// Present after install (or other mutators) that can partial-succeed.
+    /// Absent on plain status probes so the contract stays light.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<OperationOutcome>,
+}
+
+/// Classify the installed Codex against our provenance store.
+pub fn mac_install_status() -> MacInstallStatus {
+    let installed = detect_managed_installed();
+    let store = ProvenanceStore::load();
+    let status = match &installed {
+        None => "none",
+        // Build-aware: a self-updated or path-reused install no longer matches
+        // its record and falls back to "external" (prompting re-adoption).
+        Some(codex) if store.is_managed_build(&codex.path, codex.build) => "managed",
+        Some(_) => "external",
+    }
+    .to_string();
+    // Report ambient ambiguity (multiple lineage installs) unless provenance
+    // already pins which install the user manages.
+    let ambiguous_paths = match &installed {
+        Some(codex) if !store.is_managed_build(&codex.path, codex.build) => {
+            let candidates = sys::installed_codex_candidates();
+            (candidates.len() > 1).then(|| candidates.into_iter().map(|(path, _)| path).collect())
+        }
+        _ => None,
+    };
+    MacInstallStatus {
+        installed,
+        status,
+        ambiguous_paths,
+        outcome: None,
+    }
+}
+
+/// Adopt the detected install — record provenance after explicit user consent.
+pub fn mac_adopt() -> Result<MacInstallStatus, AppError> {
+    // Ambient adoption picks the canonical-order first install; with several
+    // lineage installs coexisting that silently chooses for the user and every
+    // later update/uninstall would act on a target they never confirmed.
+    // Force the explicit path-picking flow instead.
+    let mut candidates = sys::installed_codex_candidates();
+    if candidates.len() > 1 {
+        let paths: Vec<String> = candidates.into_iter().map(|(path, _)| path).collect();
+        return Err(AppError::Internal(format!(
+            "检测到多个 Codex 安装（{}）。请使用「选择已安装的 Codex」手动指定要管理的那一个",
+            paths.join("、")
+        )));
+    }
+    // Adopt exactly the install the ambiguity check saw — a second scan could
+    // pick a DIFFERENT path if another install appeared in between, recording
+    // provenance for something the user never looked at.
+    let (path, build) = candidates
+        .pop()
+        .ok_or_else(|| AppError::Internal("no Codex detected to adopt".to_string()))?;
+    let installed = installed_from_path_build(path, build);
+    // Same gate as the manual picker — ambient adoption must not manage a
+    // bundle whose running instance cannot be located.
+    require_not_translocation_risk(&installed.path)?;
+    let path = &installed.path;
+    log::info!("macOS adopt external install path={path}");
+    let mut store = ProvenanceStore::load();
+    store.record(installed.path.clone(), installed.build, "adopted-external");
+    store.save()?;
+    Ok(mac_install_status())
+}
+
+pub fn mac_adopt_path(path: &Path) -> Result<MacInstallStatus, AppError> {
+    let installed = detect_existing_install_at_path(path)?;
+    let install_path = &installed.path;
+    log::info!("macOS adopt selected install path={install_path}");
+    let mut store = ProvenanceStore::load();
+    store.record(installed.path.clone(), installed.build, "adopted-external");
+    store.save()?;
+    Ok(mac_install_status())
+}
+
+/// Can we create (and remove) a file in `dir`? Used to decide whether the
+/// system `/Applications` is writable before attempting an install there.
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(".cam-write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Choose the install directory: `/Applications` when writable, otherwise the
+/// no-admin `~/Applications` (created if needed). Lets non-admin / managed Macs
+/// install without elevation.
+fn choose_install_dir() -> Result<PathBuf, AppError> {
+    let system = PathBuf::from("/Applications");
+    if dir_writable(&system) {
+        return Ok(system);
+    }
+    let home =
+        std::env::var("HOME").map_err(|_| AppError::Engine("找不到用户主目录".to_string()))?;
+    let user_apps = PathBuf::from(home).join("Applications");
+    std::fs::create_dir_all(&user_apps)
+        .map_err(|e| AppError::Engine(format!("创建 ~/Applications 失败: {e}")))?;
+    Ok(user_apps)
+}
+
+/// Fresh install: download the appcast's full package, verify + gate it, and
+/// place it under `/Applications` (or `~/Applications` when the system folder
+/// isn't writable). No delta, no quit (nothing running), no backup (nothing to
+/// replace). Records `manager-installed` provenance; launch remains an explicit
+/// user action in the completion UI.
+pub fn install_macos(progress: &dyn Fn(DownloadProgress)) -> Result<MacInstallStatus, AppError> {
+    install_macos_with_network(progress, &NetworkConfig::system())
+}
+
+pub fn install_macos_with_network(
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+) -> Result<MacInstallStatus, AppError> {
+    install_macos_with_network_and_phase(progress, network, None)
+}
+
+pub fn install_macos_with_network_and_phase(
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+    phase_hook: Option<&PhaseHook<'_>>,
+) -> Result<MacInstallStatus, AppError> {
+    log::info!("macOS install start");
+    // Reset on op end, not entry — race-free cancel (see AbortGuard).
+    let _abort_guard = AbortGuard::new();
+    if detect_installed().is_some() {
+        return Err(AppError::Engine(
+            "已检测到 Codex,请使用更新而非安装".to_string(),
+        ));
+    }
+
+    let install_dir = choose_install_dir()?;
+    let install_path = install_dir.join(CANONICAL_BUNDLE_NAME);
+
+    let arch = if std::env::consts::ARCH == "aarch64" {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    let (_, appcast) = fetch_appcast_for_arch(arch, network)?;
+    if let Some(latest) = appcast.latest() {
+        require_os_supported(latest.minimum_system_version.as_deref())?;
+    }
+    let plan = plan_update(&appcast, 0)
+        .ok_or_else(|| AppError::Engine("appcast had no items".to_string()))?;
+    preflight_mac_disk(&plan)?;
+    // Cancel checkpoint before bytes flow (mirrors perform) — makes a fresh
+    // install's "正在准备" cancellable too.
+    check_update_abort()?;
+
+    let staging = staging::create_unique_staging("update")?;
+    let install_result = install_macos_in_staging(
+        &appcast,
+        &install_dir,
+        &install_path,
+        &staging,
+        progress,
+        network,
+        phase_hook,
+    );
+    match install_result {
+        Ok(status) => {
+            staging.discard();
+            // Consumed on success — clear it (best-effort; the stale sweep
+            // reclaims any leftover). A failed install keeps the cached partial
+            // (Err arm) so the next attempt resumes instead of restarting.
+            let _ = staging::clear_download_cache();
+            let build = status.installed.as_ref().map(|installed| installed.build);
+            log::info!("macOS install complete build={build:?}");
+            Ok(status)
+        }
+        Err(err) => {
+            staging.discard();
+            log::error!("macOS install failed error={err}");
+            Err(err)
+        }
+    }
+}
+
+fn install_macos_in_staging(
+    appcast: &Appcast,
+    install_dir: &Path,
+    install_path: &Path,
+    staging: &StagingDir,
+    progress: &dyn Fn(DownloadProgress),
+    network: &NetworkConfig,
+    phase_hook: Option<&PhaseHook<'_>>,
+) -> Result<MacInstallStatus, AppError> {
+    let work = staging.path();
+    let out_app = staging.join(CANONICAL_BUNDLE_NAME);
+    let _ = std::fs::remove_dir_all(&out_app);
+
+    // Full package only — no basis bundle to delta against.
+    reconstruct_full(appcast, work, &out_app, progress, network)?;
+    if let Some(hook) = phase_hook {
+        hook(OperationPhase::Verifying);
+    }
+    gate_reconstructed(&out_app)
+        .map_err(|e| AppError::Engine(format!("codesign 闸失败（拒绝安装）: {e}")))?;
+
+    if !codex_mac_engine::swap::same_volume(&out_app, install_dir) {
+        return Err(AppError::Engine(format!(
+            "暂存目录与 {} 不在同一卷,无法安装",
+            install_dir.display()
+        )));
+    }
+    // Publish the point-of-no-return while the same operation token is still
+    // held, then perform one final cancel checkpoint. A cancel that won the
+    // operation mutex first leaves its latch for this checkpoint; a later cancel
+    // sees Committing and is rejected instead of racing the rename.
+    if let Some(hook) = phase_hook {
+        hook(OperationPhase::Committing);
+    }
+    check_update_abort()?;
+    std::fs::rename(&out_app, install_path)
+        .map_err(|e| AppError::Engine(format!("写入 {} 失败: {e}", install_dir.display())))?;
+    if let Some(hook) = phase_hook {
+        hook(OperationPhase::Finishing);
+    }
+
+    let mut outcome = OperationOutcome::full_success("present", Some("managed"));
+    outcome.cleanup = StepOutcome::not_applicable();
+    if let Some((path, build)) = sys::installed_codex_build() {
+        outcome.path = Some(path.clone());
+        let mut store = ProvenanceStore::load();
+        store.record(path, build, "manager-installed");
+        // The app is on disk now. Provenance save is ancillary: never turn a
+        // landed install into a hard failure (that would invite a re-install).
+        if let Err(e) = store.save() {
+            let detail = format!("托管记录保存失败（{e}）");
+            outcome.provenance = StepOutcome::failed(detail.clone());
+            outcome.push_warning(format!(
+                "{detail}；应用已在磁盘上，请用「开始管理」重试写入托管记录，勿重复安装"
+            ));
+            outcome.push_recovery(recovery::RECORD_PROVENANCE);
+            outcome.install_class = Some("external".to_string());
+        }
+    } else {
+        outcome.path = Some(install_path.to_string_lossy().into_owned());
+        outcome.provenance = StepOutcome::failed("安装后未能读取 bundle 版本，托管记录未写入");
+        outcome.push_warning("已写入应用，但未能确认版本；请重新检查状态或「开始管理」".to_string());
+        outcome.push_recovery(recovery::RECORD_PROVENANCE);
+        outcome.install_class = Some("external".to_string());
+        // Honest: app may be present but we couldn't classify it as managed.
+        outcome.app_state = "present".to_string();
+    }
+    // Do NOT auto-launch — the UI shows a completion state with an explicit
+    // 〔打开 Codex〕 button so opening is the user's choice, not a surprise.
+    let mut status = mac_install_status();
+    // Prefer the live classification after the attempted record write.
+    if outcome.provenance.is_failed() {
+        status.status = "external".to_string();
+    }
+    status.outcome = Some(outcome);
+    Ok(status)
+}
+
+/// Open the installed Codex app — invoked by the UI's explicit 〔打开 Codex〕
+/// action (we no longer auto-launch after a fresh install).
+pub fn launch_codex() -> Result<(), AppError> {
+    let installed = detect_managed_installed()
+        .ok_or_else(|| AppError::Engine("没有可打开的 Codex".to_string()))?;
+    let settings = crate::app::settings_store::AppSettings::load();
+    if settings.disable_codex_self_updates {
+        crate::app::codex_self_update::sync_setting(true)?;
+    }
+    let path = &installed.path;
+    log::info!("macOS launch Codex path={path}");
+    let mut command = std::process::Command::new(OPEN);
+    crate::app::codex_self_update::apply_to_command(
+        &mut command,
+        settings.disable_codex_self_updates,
+    );
+    command.arg(&installed.path);
+    run_open_and_confirm(&mut command, Path::new(path), "打开 Codex")
+}
+
+pub(crate) fn run_open_and_confirm(
+    command: &mut std::process::Command,
+    installed: &Path,
+    action: &str,
+) -> Result<(), AppError> {
+    let output = command.output().map_err(|e| {
+        log::warn!("macOS launch Codex failed error={e}");
+        AppError::Engine(format!("{action}失败: {e}"))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            output.status.to_string()
+        } else {
+            stderr
+        };
+        log::warn!("macOS launch Codex rejected detail={detail}");
+        return Err(AppError::Engine(format!("{action}失败: {detail}")));
+    }
+    if !codex_mac_engine::swap::wait_for_codex_running(
+        installed,
+        std::time::Duration::from_secs(10),
+    ) {
+        return Err(AppError::Engine(format!(
+            "{action}请求已被 macOS 接收，但 ChatGPT 进程未能持续运行；请在 Finder 中直接打开 {} 查看系统提示",
+            installed.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Preparing-phase abort latch. The download loop has its own cancel flag once
+/// curl is running, but everything BEFORE the first byte — appcast fetch,
+/// planning, disk preflight — used to be an uncancellable wait. This latch lets
+/// a cancel pressed during "正在准备" be honored at the next checkpoint.
+static UPDATE_ABORT: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn clear_update_abort() {
+    UPDATE_ABORT.store(false, Ordering::SeqCst);
+}
+
+/// Resets the abort latch when the operation that owns it ends — on EVERY path
+/// (success, error, early return, panic). Clearing on DROP (not at entry) is what
+/// makes the latch race-free: a cancel that lands in the window between the UI
+/// showing its cancel button and this operation reaching its first checkpoint is
+/// NOT wiped by an entry-clear, so the checkpoint still observes it; the latch is
+/// reset only once this operation is done, leaving the next one clean. The cancel
+/// command now binds the latch to the owning operation under the op lock, but the
+/// worker may still be between entry and its first checkpoint — hence the guard
+/// instead of an entry reset.
+struct AbortGuard;
+
+static UPDATE_ABORT_GUARD_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+impl AbortGuard {
+    fn new() -> Self {
+        UPDATE_ABORT_GUARD_DEPTH.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        let previous = UPDATE_ABORT_GUARD_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "AbortGuard depth underflow");
+        if previous == 1 {
+            clear_update_abort();
+        }
+    }
+}
+
+/// Bail out of the preparing phase when the user cancelled. Surfaces the same
+/// "download cancelled" marker the curl-cancel path uses, so the UI treats it
+/// as a cancel (routes home + cancelled notice) uniformly.
+fn check_update_abort() -> Result<(), AppError> {
+    if UPDATE_ABORT.load(Ordering::SeqCst) {
+        Err(AppError::Engine("download cancelled".to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn pause_macos_download() -> bool {
+    // Pause is only offered once bytes are flowing (UI disables it during
+    // preparing), so it stays a pure download-loop operation — keep the `.part`.
+    let requested = download::pause_active_download();
+    log::info!("macOS pause download requested={requested}");
+    requested
+}
+
+pub fn cancel_macos_download() -> bool {
+    // Latch the preparing-phase abort too: a cancel pressed before the first
+    // byte (or mid appcast-fetch) is honored at the next checkpoint, not just an
+    // already-running curl. Report actionable unconditionally — during preparing
+    // the latch IS the cancel mechanism, so the UI must not say "不能取消".
+    UPDATE_ABORT.store(true, Ordering::SeqCst);
+    let requested = download::cancel_active_download();
+    log::info!("macOS cancel download requested={requested}");
+    true
+}
+
+/// Paused-state cancel: the download already stopped and its `.part` is on disk.
+/// Clear the cache so "继续" can't resume, and drop the abort latch. Surfaces a
+/// removal failure (vs. silently reporting a cancel that left the partial behind,
+/// which a later run would then resume).
+pub fn discard_macos_download() -> Result<(), AppError> {
+    clear_update_abort();
+    staging::clear_download_cache()
+        .map_err(|e| AppError::Internal(format!("清理下载缓存失败: {e}")))?;
+    log::info!("macOS discard download cache");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacUninstallReport {
+    pub removed: bool,
+    pub kept_codex_home: bool,
+    pub message: String,
+    /// Structured primary/ancillary result for partial-success recovery.
+    pub outcome: OperationOutcome,
+}
+
+/// Remove the installed Codex app. Only uninstalls an install THIS manager
+/// manages — an external (official / manual) install must be explicitly adopted
+/// first, so we never delete something we didn't create. `keep_codex_home` is
+/// true by default at the UI: the user's `~/.codex` (sign-in, sessions, config)
+/// survives unless they explicitly opt out. Quits Codex first (never force-kills).
+pub fn uninstall_macos(keep_codex_home: bool) -> Result<MacUninstallReport, AppError> {
+    log::info!("macOS uninstall start keep_codex_home={keep_codex_home}");
+    let installed = detect_managed_installed()
+        .ok_or_else(|| AppError::Engine("no Codex detected to uninstall".to_string()))?;
+    let install_path = PathBuf::from(&installed.path);
+
+    // Boundary: refuse to delete anything that isn't an install we manage at this
+    // exact build (path-only matching could delete a path-reused external install
+    // or one left by a stale record).
+    let mut store = ProvenanceStore::load();
+    if !store.is_managed_build(&installed.path, installed.build) {
+        return Err(AppError::Engine(
+            "这是外部安装的 Codex,或版本与托管记录不一致。请先在主界面「开始管理」纳入管理后再卸载。"
+                .to_string(),
+        ));
+    }
+
+    // A translocated live instance would be invisible to the quit check —
+    // re-verify before the destructive delete, same as perform.
+    require_not_translocation_risk(&installed.path)?;
+    quit_codex_gracefully(&install_path)?;
+
+    // Delete first: if we lack permission to remove the bundle (e.g. a root-owned
+    // install), the managed record stays intact so the user can retry without
+    // re-adopting.
+    std::fs::remove_dir_all(&install_path)
+        .map_err(|e| AppError::Engine(format!("remove app bundle: {e}")))?;
+
+    let mut outcome =
+        OperationOutcome::full_success("absent", Some("none")).with_path(installed.path.clone());
+
+    // The app is gone — drop the provenance record. If the write fails, surface
+    // it: a stale record could misclassify a same-path/same-build reinstall.
+    store.managed.retain(|r| r.path != installed.path);
+    if let Err(e) = store.save() {
+        let detail = format!("托管记录清除失败（{e}）");
+        outcome.provenance = StepOutcome::failed(detail.clone());
+        outcome.push_warning(detail);
+        outcome.push_recovery(recovery::CLEAR_PROVENANCE);
+    }
+
+    // Only ever touch ~/.codex when the user explicitly opted out of keeping it.
+    // If the removal fails (e.g. permissions), report honestly rather than
+    // claiming the data was cleared.
+    let (kept_codex_home, mut message) = if keep_codex_home {
+        outcome.cleanup = StepOutcome::skipped("保留用户数据 ~/.codex");
+        (true, "已卸载 Codex,保留了 ~/.codex".to_string())
+    } else {
+        // Best-effort, non-fatal: a purge failure must not abort the uninstall
+        // report. But like the Windows path (purge_codex_user_data), surface the
+        // real underlying io/fs error instead of a generic "purge failed" so the
+        // user can diagnose it (permissions, busy file, …) rather than guess.
+        let mut purge_err: Option<String> = None;
+        if let Ok(home) = std::env::var("HOME") {
+            let codex_home = PathBuf::from(home).join(".codex");
+            if codex_home.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&codex_home) {
+                    purge_err = Some(e.to_string());
+                }
+            }
+        }
+        match purge_err {
+            None => {
+                outcome.cleanup = StepOutcome::ok_detail("已清除 ~/.codex");
+                (false, "已卸载 Codex,并清除了 ~/.codex".to_string())
+            }
+            Some(err) => {
+                let detail = format!("~/.codex 清除失败,数据仍保留: {err}");
+                outcome.cleanup = StepOutcome::failed(detail.clone());
+                outcome.push_warning(detail.clone());
+                outcome.push_recovery(recovery::PURGE_USER_DATA);
+                (true, format!("已卸载 Codex,但 {detail}"))
+            }
+        }
+    };
+    if outcome.provenance.is_failed() {
+        message.push_str("；托管记录更新失败,可仅重试清除记录（无需再卸载）");
+    }
+
+    let report = MacUninstallReport {
+        removed: true,
+        kept_codex_home,
+        message,
+        outcome,
+    };
+    log::info!(
+        "macOS uninstall complete keep_codex_home={}",
+        report.kept_codex_home
+    );
+    Ok(report)
+}
+
+/// Retry only failed ancillary steps after a macOS uninstall (or install
+/// provenance write). Never re-deletes the app bundle.
+pub fn retry_macos_ancillary(
+    actions: &[String],
+    path: Option<&str>,
+    purge_user_data: bool,
+) -> Result<crate::app::operation_outcome::AncillaryRetryReport, AppError> {
+    retry_macos_ancillary_with_detector(actions, path, purge_user_data, || {
+        detect_managed_installed().or_else(detect_installed)
+    })
+}
+
+fn retry_macos_ancillary_with_detector<F>(
+    actions: &[String],
+    path: Option<&str>,
+    purge_user_data: bool,
+    detect_install: F,
+) -> Result<crate::app::operation_outcome::AncillaryRetryReport, AppError>
+where
+    F: FnOnce() -> Option<InstalledCodex>,
+{
+    use crate::app::operation_outcome::AncillaryRetryReport;
+
+    let mut outcome = OperationOutcome {
+        primary_ok: true,
+        app_state: "unknown".to_string(),
+        install_class: None,
+        path: path.map(str::to_string),
+        provenance: StepOutcome::not_applicable(),
+        cleanup: StepOutcome::not_applicable(),
+        warnings: Vec::new(),
+        recovery_actions: Vec::new(),
+    };
+    let mut messages = Vec::new();
+
+    if actions.iter().any(|a| a == recovery::RECORD_PROVENANCE) {
+        // Re-record currently detected install as managed — same as adopt, but
+        // as an explicit recovery path for "installed, record failed".
+        match detect_install() {
+            Some(installed) => {
+                let mut store = ProvenanceStore::load();
+                store.record(
+                    installed.path.clone(),
+                    installed.build,
+                    "manager-installed",
+                );
+                match store.save() {
+                    Ok(()) => {
+                        outcome.provenance = StepOutcome::ok();
+                        outcome.app_state = "present".to_string();
+                        outcome.install_class = Some("managed".to_string());
+                        messages.push("托管记录已重新写入".to_string());
+                    }
+                    Err(e) => {
+                        outcome.provenance = StepOutcome::failed(e.to_string());
+                        outcome.push_recovery(recovery::RECORD_PROVENANCE);
+                        messages.push(format!("托管记录写入仍失败: {e}"));
+                    }
+                }
+            }
+            None => {
+                outcome.provenance = StepOutcome::failed("未检测到可记录的 Codex 安装");
+                outcome.app_state = "absent".to_string();
+                messages.push("未检测到 Codex，无法写入托管记录".to_string());
+            }
+        }
+        // Every failed record attempt remains retryable, including the
+        // no-install-detected branch above. Keep this invariant outside the
+        // individual match arms so future failure paths cannot omit the CTA.
+        outcome.retain_failed_provenance_recovery(recovery::RECORD_PROVENANCE);
+    }
+
+    if actions.iter().any(|a| a == recovery::CLEAR_PROVENANCE) {
+        let mut store = ProvenanceStore::load();
+        if let Some(path) = path {
+            store.remove(path);
+        } else {
+            // Drop records whose path no longer exists (stale after uninstall).
+            store.managed.retain(|r| Path::new(&r.path).exists());
+        }
+        match store.save() {
+            Ok(()) => {
+                outcome.provenance = StepOutcome::ok();
+                messages.push("陈旧托管记录已清除".to_string());
+            }
+            Err(e) => {
+                outcome.provenance = StepOutcome::failed(e.to_string());
+                outcome.push_recovery(recovery::CLEAR_PROVENANCE);
+                messages.push(format!("清除托管记录仍失败: {e}"));
+            }
+        }
+    }
+
+    if actions.iter().any(|a| a == recovery::PURGE_USER_DATA) && purge_user_data {
+        let mut purge_err: Option<String> = None;
+        if let Ok(home) = std::env::var("HOME") {
+            let codex_home = PathBuf::from(home).join(".codex");
+            if codex_home.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&codex_home) {
+                    purge_err = Some(e.to_string());
+                }
+            }
+        }
+        match purge_err {
+            None => {
+                outcome.cleanup = StepOutcome::ok_detail("已清除 ~/.codex");
+                messages.push("用户数据已清除".to_string());
+            }
+            Some(err) => {
+                outcome.cleanup = StepOutcome::failed(err.clone());
+                outcome.push_recovery(recovery::PURGE_USER_DATA);
+                messages.push(format!("清除用户数据仍失败: {err}"));
+            }
+        }
+    }
+
+    if messages.is_empty() {
+        return Err(AppError::Internal(
+            "没有可执行的恢复步骤（请传入 record_provenance / clear_provenance / purge_user_data）"
+                .to_string(),
+        ));
+    }
+
+    Ok(AncillaryRetryReport {
+        message: messages.join("；"),
+        outcome,
+    })
+}
+
+#[cfg(test)]
+mod disk_preflight_tests {
+    use super::*;
+
+    fn plan(download_size: u64, full_size: u64, strategy: UpdateStrategy) -> UpdatePlan {
+        UpdatePlan {
+            up_to_date: false,
+            current_build: 1,
+            latest_build: 2,
+            latest_short_version: "2.0.0".to_string(),
+            strategy,
+            download_url: "https://example.com/Codex.zip".to_string(),
+            download_size,
+            ed_signature: Some("sig".to_string()),
+            full_size,
+            savings_pct: 0.0,
+        }
+    }
+
+    #[test]
+    fn mac_space_budget_accounts_for_delta_full_fallback_and_headroom() {
+        let p = plan(10, 100, UpdateStrategy::Delta { from_build: 1 });
+        assert_eq!(mac_space_budget(&p), 10 + 300 + 512 * 1024 * 1024);
+
+        let p = plan(u64::MAX, u64::MAX, UpdateStrategy::Full);
+        assert_eq!(mac_space_budget(&p), u64::MAX);
+    }
+
+    #[test]
+    fn preflight_mac_disk_rejects_low_space_and_allows_unknown_space() {
+        let p = plan(100, 200, UpdateStrategy::Full);
+        let err = preflight_mac_disk_with_available(&p, |_| Ok(Some(10))).unwrap_err();
+        assert!(err.to_string().contains("磁盘可用空间不足"));
+
+        assert!(preflight_mac_disk_with_available(&p, |_| Ok(None)).is_ok());
+        assert!(preflight_mac_disk_with_available(&p, |_| Ok(Some(mac_space_budget(&p)))).is_ok());
+    }
+
+    #[test]
+    fn retry_record_provenance_without_detected_install_keeps_retry_action() {
+        let report = retry_macos_ancillary_with_detector(
+            &[recovery::RECORD_PROVENANCE.to_string()],
+            None,
+            false,
+            || None,
+        )
+        .expect("a missing install is a retryable ancillary result");
+
+        assert!(report.outcome.provenance.is_failed());
+        assert!(report
+            .outcome
+            .recovery_actions
+            .iter()
+            .any(|action| action == recovery::RECORD_PROVENANCE));
+    }
+}
+
+// The full-update unpack branch is new logic (the delta/gate/swap tail reuses
+// engine primitives already proven on real /Applications). `ditto` is macOS-only,
+// so these stay gated off the cross-compiled Windows build.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abort_guard_preserves_a_startup_race_cancel_and_resets_on_drop() {
+        let _serial = crate::app::oplock::CANCEL_LATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The race a reviewer flagged: a cancel can land BEFORE perform reaches
+        // its first checkpoint even though the command now validates the owning
+        // token under the op lock. Clearing the latch at op ENTRY would wipe that
+        // cancel; AbortGuard clears on DROP instead, so a pending cancel survives
+        // the guard's creation and is still observed, while the next op starts
+        // clean. OperationManager cleanup shares the same test-only serial lock.
+        UPDATE_ABORT.store(true, Ordering::SeqCst); // a cancel that beat the op
+        {
+            let outer = AbortGuard::new();
+            let inner = AbortGuard::new();
+            assert!(
+                check_update_abort().is_err(),
+                "guard creation must not wipe a pending cancel"
+            );
+            drop(inner);
+            assert!(
+                check_update_abort().is_err(),
+                "a nested guard must not clear the owning operation's cancel"
+            );
+            drop(outer);
+        }
+        assert!(
+            check_update_abort().is_ok(),
+            "guard drop must reset the latch for the next op"
+        );
+    }
+
+    fn ditto(args: &[&str]) {
+        let status = std::process::Command::new(DITTO)
+            .args(args)
+            .status()
+            .expect("spawn ditto");
+        assert!(status.success(), "ditto {args:?} failed");
+    }
+
+    fn write_bundle_plist(app: &Path, bundle_id: &str) {
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>{bundle_id}</string>
+    <key>CFBundleExecutable</key>
+    <string>ChatGPT</string>
+    <key>CFBundleVersion</key>
+    <string>5059</string>
+</dict>
+</plist>
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_manager_install_migrates_only_to_free_chatgpt_path() {
+        let root = std::env::temp_dir().join(format!("codex-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join(LEGACY_BUNDLE_NAME);
+        write_bundle_plist(&legacy, sys::CODEX_BUNDLE_ID);
+        let record = ManagedRecord {
+            path: legacy.to_string_lossy().into_owned(),
+            build: 5059,
+            source: "manager-installed".to_string(),
+            adopted_at_unix: 1,
+        };
+
+        let (from, to, build) = legacy_migration_target(&record).expect("eligible old install");
+        assert_eq!(from, legacy);
+        assert_eq!(to, root.join(CANONICAL_BUNDLE_NAME));
+        assert_eq!(build, 5059);
+
+        std::fs::create_dir_all(root.join(CANONICAL_BUNDLE_NAME)).unwrap();
+        assert!(
+            legacy_migration_target(&record).is_none(),
+            "an existing ChatGPT.app must never be overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adopted_external_legacy_install_is_not_renamed() {
+        let root = std::env::temp_dir().join(format!("codex-adopted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join(LEGACY_BUNDLE_NAME);
+        write_bundle_plist(&legacy, sys::CODEX_BUNDLE_ID);
+        let record = ManagedRecord {
+            path: legacy.to_string_lossy().into_owned(),
+            build: 5059,
+            source: "adopted-external".to_string(),
+            adopted_at_unix: 1,
+        };
+        assert!(legacy_migration_target(&record).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_app_zip_surfaces_bundle() {
+        let root = std::env::temp_dir().join(format!("codex-unpack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A synthetic post-rebrand bundle (named ChatGPT.app, Codex identity),
+        // zipped the way Sparkle ships a macOS full update (`ditto -c -k
+        // --keepParent` → the `.app` is the top-level entry). unpack must accept
+        // it by identity and normalize it to the caller's out_app name.
+        let src_app = root.join("ChatGPT.app");
+        write_bundle_plist(&src_app, sys::CODEX_BUNDLE_ID);
+        std::fs::write(src_app.join("Contents/marker"), "5059").unwrap();
+        let zip = root.join("Codex.zip");
+        ditto(&[
+            "-c",
+            "-k",
+            "--keepParent",
+            &src_app.to_string_lossy(),
+            &zip.to_string_lossy(),
+        ]);
+
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let out_app = work.join(CANONICAL_BUNDLE_NAME);
+        unpack_app_zip(&zip, &work, &out_app).unwrap();
+
+        assert!(out_app.join("Contents/marker").exists(), "bundle surfaced");
+        assert_eq!(
+            std::fs::read_to_string(out_app.join("Contents/marker")).unwrap(),
+            "5059"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_single_codex_app_rejects_multiple_apps() {
+        let root = std::env::temp_dir().join(format!("codex-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Other.app")).unwrap();
+        std::fs::create_dir_all(root.join("Codex.app")).unwrap();
+
+        let err = require_single_codex_app(&root).unwrap_err();
+        assert!(err.to_string().contains("multiple .app"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_single_codex_app_gates_on_bundle_identity() {
+        let root = std::env::temp_dir().join(format!("codex-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // ChatGPT Classic in the archive: right name shape, wrong product.
+        let classic = root.join("classic");
+        write_bundle_plist(&classic.join("ChatGPT.app"), "com.openai.chat");
+        let err = require_single_codex_app(&classic).unwrap_err();
+        assert!(err.to_string().contains("com.openai.chat"));
+
+        // Rebranded Codex: accepted regardless of the bundle's file name.
+        let rebranded = root.join("rebranded");
+        write_bundle_plist(&rebranded.join("ChatGPT.app"), sys::CODEX_BUNDLE_ID);
+        let found = require_single_codex_app(&rebranded).unwrap();
+        assert!(found.ends_with("ChatGPT.app"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

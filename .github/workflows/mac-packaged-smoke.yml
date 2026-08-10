@@ -1,0 +1,122 @@
+name: macOS packaged smoke
+
+# PR-only unsigned bundle gate for native-shell behavior that cargo tests cannot
+# exercise: packaged WebKit IPC/CSP, native menus, single-instance activation,
+# and macOS close/quit shortcuts. It deliberately uses no signing, updater, or
+# notarization secrets; Developer ID and App Store Connect remain release-only.
+on:
+  pull_request:
+    paths:
+      - "src-tauri/tauri.conf.json"
+      - "src-tauri/tauri.smoke.conf.json"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/capabilities/**"
+      - "src-tauri/src/**"
+      - "src/**"
+      - "index.html"
+      - "vite.config.ts"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/macos-packaged-smoke.sh"
+      - ".github/workflows/mac-packaged-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-packaged-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: ${{ matrix.name }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64 / 简体中文
+            platform: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+            lang: zh-CN
+            apple_language: zh-Hans
+          - name: x64 / English
+            platform: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            lang: en
+            apple_language: en
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - name: Build isolated unsigned app bundle
+        run: |
+          npm run tauri build -- \
+            --config src-tauri/tauri.smoke.conf.json \
+            --bundles app \
+            --target "${{ matrix.target }}" \
+            --no-sign \
+            --ci
+
+      - name: Locate app bundle
+        id: artifact
+        run: |
+          APP="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::[bundle] no .app bundle produced"
+            exit 1
+          fi
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Packaged native-shell lifecycle smoke
+        run: |
+          bash scripts/macos-packaged-smoke.sh \
+            "${{ steps.artifact.outputs.app }}" \
+            --expected-arch "${{ matrix.arch }}" \
+            --expected-lang "${{ matrix.lang }}" \
+            --apple-language "${{ matrix.apple_language }}"
+
+      - name: Collect smoke logs
+        if: ${{ always() }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/macos-smoke-logs"
+          find "$HOME/Library/Logs/io.github.wangnov.codexappmanager.smoke" \
+            -maxdepth 1 -type f -name '*.log' \
+            -exec cp {} "$RUNNER_TEMP/macos-smoke-logs/" \; 2>/dev/null || true
+
+      - name: Upload smoke logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: macos-smoke-logs-${{ matrix.target }}
+          path: ${{ runner.temp }}/macos-smoke-logs/*.log
+          if-no-files-found: warn
+
+      - name: Upload app bundle on failure
+        if: ${{ failure() && steps.artifact.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: macos-smoke-app-${{ matrix.target }}
+          path: ${{ steps.artifact.outputs.app }}
+          if-no-files-found: error

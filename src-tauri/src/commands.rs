@@ -1,0 +1,2400 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use codex_win_engine::{
+    close_codex_gracefully_for_root, close_patched_chinese_processes, patch_codex_chinese,
+    ChinesePatchReport, InstalledWindowsCodex,
+};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_updater::UpdaterExt;
+
+use crate::app::atomic_file;
+use crate::app::config_health::ConfigHealth;
+use crate::app::diagnostics::Diagnostics;
+use crate::app::disk::available_space;
+use crate::app::logging::redact_url;
+use crate::app::mac_update::{
+    cancel_macos_download, detect_existing_install_at_path as detect_macos_install_at_path,
+    discard_macos_download, install_macos_with_network_and_phase,
+    mac_adopt_path as adopt_macos_path, pause_macos_download,
+    perform_macos_update_with_network_and_phase,
+    plan_macos_update_with_network, retry_macos_ancillary, stage_macos_update_with_network,
+    uninstall_macos, InstalledCodex, MacInstallStatus, MacPerformReport, MacStageReport,
+    MacUninstallReport, MacUpdateReport, PerformExpectation,
+};
+use crate::app::op_phase::{OperationPhase, QuitPolicy};
+use crate::app::operation_outcome::{AncillaryRetryReport, AncillaryRetryRequest};
+use crate::app::oplock::{
+    OperationCompletion, OperationError, OperationGuard, OperationKind, OperationManager,
+    OperationProgress, OperationSnapshot, OperationToken,
+};
+use crate::app::paths;
+use crate::app::provenance::ProvenanceStore;
+use crate::app::settings_store::AppSettings as PersistedAppSettings;
+use crate::app::settings_store::{ProxyMode, UpdateSource};
+use crate::app::url_guard::{validate_custom_proxy, validate_custom_source};
+use crate::app::window_mode::{self, WindowMode, WindowModeReport};
+use crate::app::win_update::{
+    auto_stage_windows_update_with_install_mode_and_network, cancel_windows_download,
+    detect_existing_windows_install_at_path as detect_windows_install_at_path,
+    discard_windows_download, pause_windows_download,
+    perform_windows_update_with_install_mode_network_and_phase,
+    plan_windows_update_with_install_mode_and_network,
+    resolve_windows_localization_target, retry_windows_ancillary,
+    stage_windows_update_with_install_mode_and_network,
+    uninstall_windows_codex, win_adopt as adopt_windows_install,
+    win_adopt_path as adopt_windows_path, win_install_status,
+    DownloadProgress as WinDownloadProgress, OperationEvidence, WinAutoStageReport, WinInstallStatus,
+    WinPerformExpectation, WinPerformReport, WinStageReport, WinUninstallReport, WinUpdateReport,
+};
+use crate::domain::settings::AppSettings as DomainAppSettings;
+use crate::domain::target::OperatingSystem;
+use crate::errors::{AppError, CommandError};
+use crate::state::ManagerState;
+
+fn windows_endpoints_for_settings(
+    _state: &ManagerState,
+) -> Result<crate::domain::manifest::MirrorEndpoints, AppError> {
+    crate::app::offline_bundle::windows_endpoints()
+}
+
+fn normalize_settings_for_target(
+    settings: &mut PersistedAppSettings,
+    target: &crate::domain::target::Target,
+) {
+    if matches!(target.os, OperatingSystem::Windows) && settings.source == UpdateSource::Official {
+        settings.source = UpdateSource::Auto;
+    }
+}
+
+fn windows_install_mode_for_settings() -> String {
+    let saved = PersistedAppSettings::load();
+    if saved.windows_install_mode == "portable" {
+        "portable".to_string()
+    } else {
+        "msix".to_string()
+    }
+}
+
+fn validated_custom_proxy_for_settings(raw: &str, context: &str) -> Result<String, AppError> {
+    validate_custom_proxy(raw).map_err(|e| {
+        log::warn!("url_guard rejected {context} proxy reason={e}");
+        AppError::Engine(e.to_string())
+    })
+}
+
+fn mac_network_config_for_settings() -> Result<codex_mac_engine::NetworkConfig, AppError> {
+    let saved = PersistedAppSettings::load();
+    match saved.proxy_mode {
+        ProxyMode::System => Ok(codex_mac_engine::NetworkConfig::system()),
+        ProxyMode::Direct => Ok(codex_mac_engine::NetworkConfig::direct()),
+        ProxyMode::Custom => {
+            let proxy = validated_custom_proxy_for_settings(&saved.custom_proxy_url, "mac update")?;
+            Ok(codex_mac_engine::NetworkConfig::custom(proxy))
+        }
+    }
+}
+
+fn win_network_config_for_settings() -> Result<codex_win_engine::NetworkConfig, AppError> {
+    let saved = PersistedAppSettings::load();
+    match saved.proxy_mode {
+        ProxyMode::System => Ok(codex_win_engine::NetworkConfig::system()),
+        ProxyMode::Direct => Ok(codex_win_engine::NetworkConfig::direct()),
+        ProxyMode::Custom => {
+            let proxy =
+                validated_custom_proxy_for_settings(&saved.custom_proxy_url, "Windows update")?;
+            Ok(codex_win_engine::NetworkConfig::custom(proxy))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerUpdateMetadata {
+    pub version: String,
+    pub current_version: String,
+    pub body: Option<String>,
+}
+
+fn manager_updater_builder(
+    app: &AppHandle,
+) -> Result<tauri_plugin_updater::UpdaterBuilder, AppError> {
+    let saved = PersistedAppSettings::load();
+    let mut builder = app.updater_builder();
+    match saved.proxy_mode {
+        ProxyMode::System => {}
+        ProxyMode::Direct => {
+            builder = builder.no_proxy();
+        }
+        ProxyMode::Custom => {
+            let normalized =
+                validated_custom_proxy_for_settings(&saved.custom_proxy_url, "manager updater")?;
+            let proxy = url::Url::parse(&normalized)
+                .map_err(|e| AppError::Engine(format!("invalid proxy URL: {e}")))?;
+            builder = builder.proxy(proxy);
+        }
+    }
+    Ok(builder)
+}
+
+#[tauri::command]
+pub async fn manager_check_update(
+    app: AppHandle,
+) -> Result<Option<ManagerUpdateMetadata>, CommandError> {
+    let updater = manager_updater_builder(&app)?
+        .build()
+        .map_err(|e| AppError::Engine(format!("build manager updater: {e}")))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| AppError::Engine(format!("check manager update: {e}")))?;
+    Ok(update.map(|update| ManagerUpdateMetadata {
+        version: update.version,
+        current_version: update.current_version,
+        body: update.body,
+    }))
+}
+
+fn windows_domain_settings_for_persisted(state: &ManagerState) -> DomainAppSettings {
+    let saved = PersistedAppSettings::load();
+    let mut settings = state.settings.clone();
+    settings.install_root = saved.install_root;
+    settings.disable_codex_self_updates = saved.disable_codex_self_updates;
+    settings
+}
+
+fn dialog_start_dir(path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_dir() {
+        return path;
+    }
+    path.parent()
+        .filter(|parent| parent.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(PersistedAppSettings::load().install_root))
+}
+
+fn mac_existing_install_start_dir() -> PathBuf {
+    let system = PathBuf::from("/Applications");
+    if system.is_dir() {
+        return system;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_apps = PathBuf::from(home).join("Applications");
+        if user_apps.is_dir() {
+            return user_apps;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+const MIN_PORTABLE_FREE_SPACE_BYTES: u64 = 1_073_741_824;
+const INSTALL_LOCATION_PROBE_PREFIX: &str = ".codex-manager-install-test-";
+
+fn begin_guard(state: &ManagerState, kind: OperationKind) -> Result<OperationGuard, CommandError> {
+    state
+        .operations
+        .begin(kind)
+        .map_err(|err| {
+            log::warn!(
+                "failed to acquire operation guard kind={} error={err}",
+                kind.as_str()
+            );
+            AppError::from(err)
+        })
+        .map_err(Into::into)
+}
+
+struct DetachedGuard {
+    completion_tracking: bool,
+    operations: OperationManager,
+    succeeded: bool,
+    token: Option<OperationToken>,
+}
+
+impl DetachedGuard {
+    fn validate(state: &ManagerState, token: OperationToken) -> Result<Self, CommandError> {
+        Self::validate_inner(state, token, false)
+    }
+
+    fn validate_tracked(state: &ManagerState, token: OperationToken) -> Result<Self, CommandError> {
+        Self::validate_inner(state, token, true)
+    }
+
+    fn validate_inner(
+        state: &ManagerState,
+        token: OperationToken,
+        completion_tracking: bool,
+    ) -> Result<Self, CommandError> {
+        let operations = state.operations.clone();
+        operations
+            .validate(&token)
+            .map_err(destructive_token_error)?;
+        Ok(Self {
+            completion_tracking,
+            operations,
+            succeeded: false,
+            token: Some(token),
+        })
+    }
+
+    fn validate_with_phase(
+        state: &ManagerState,
+        token: OperationToken,
+        phase: OperationPhase,
+    ) -> Result<Self, CommandError> {
+        let operations = state.operations.clone();
+        operations
+            .validate_with_phase(&token, phase)
+            .map_err(destructive_token_error)?;
+        Ok(Self {
+            completion_tracking: false,
+            operations,
+            succeeded: false,
+            token: Some(token),
+        })
+    }
+
+    fn mark_succeeded(&mut self) {
+        self.succeeded = true;
+    }
+
+    fn set_phase(&self, phase: OperationPhase) {
+        if let Some(token) = self.token.as_ref() {
+            let _ = self.operations.set_phase(token, phase);
+        }
+    }
+
+    fn token_clone(&self) -> Option<OperationToken> {
+        self.token.clone()
+    }
+
+    fn operations(&self) -> OperationManager {
+        self.operations.clone()
+    }
+}
+
+/// Progress payload emitted on the download event bus. Includes the operation
+/// id so a reloaded frontend can reject late events from a previous op.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgressEvent {
+    downloaded: u64,
+    total: u64,
+    source: String,
+    operation_id: String,
+}
+
+fn emit_op_download_progress(
+    app: &AppHandle,
+    operations: &OperationManager,
+    token: &OperationToken,
+    channel: &str,
+    downloaded: u64,
+    total: u64,
+    source: String,
+) {
+    let progress = OperationProgress {
+        downloaded,
+        total,
+        source: source.clone(),
+    };
+    let _ = operations.set_progress(token, progress);
+    // Bytes in flight ⇒ downloading phase (unless already past it).
+    if total > 0 && downloaded < total {
+        let _ = operations.set_phase(token, OperationPhase::Downloading);
+    }
+    let _ = app.emit(
+        channel,
+        DownloadProgressEvent {
+            downloaded,
+            total,
+            source,
+            operation_id: token.0.clone(),
+        },
+    );
+}
+
+impl Drop for DetachedGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            if self.completion_tracking {
+                if let Err(error) = self.operations.record_completion(&token, self.succeeded) {
+                    log::error!("failed to record terminal operation outcome: {error}");
+                }
+            }
+            let _ = self.operations.end(token);
+        }
+    }
+}
+
+fn destructive_token_error(err: OperationError) -> CommandError {
+    match err {
+        OperationError::InvalidToken => {
+            log::warn!("destructive token validation failed");
+            AppError::StaleExpectation("操作令牌无效或已过期，请重新检查后再确认".to_string())
+                .into()
+        }
+        other => {
+            log::warn!("destructive token rejected error={other}");
+            AppError::from(other).into()
+        }
+    }
+}
+
+fn refresh_config_health(state: &ManagerState) -> ConfigHealth {
+    let (_, settings_health) = PersistedAppSettings::load_with_health();
+    let (_, provenance_health) = ProvenanceStore::load_with_health();
+    let health = ConfigHealth::from_parts(settings_health, provenance_health).with_live_backup_flags();
+    let mut slot = state
+        .config_health
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *slot = health.clone();
+    health
+}
+
+fn config_path(which: &str) -> Result<PathBuf, AppError> {
+    match which {
+        "settings" => paths::settings_path()
+            .ok_or_else(|| AppError::Internal("无法定位 settings.json 数据目录".to_string())),
+        "provenance" => paths::provenance_path()
+            .ok_or_else(|| AppError::Internal("无法定位 provenance.json 数据目录".to_string())),
+        _ => Err(AppError::Internal(
+            "配置类型必须是 settings 或 provenance".to_string(),
+        )),
+    }
+}
+
+const CODEX_ROOT_PRESET: &[(&str, &str)] = &[
+    ("model_provider", "\"donaapi\""),
+    ("model", "\"gpt-5.6-sol\""),
+    ("review_model", "\"gpt-5.6-sol\""),
+    ("model_reasoning_effort", "\"xhigh\""),
+    ("disable_response_storage", "true"),
+    ("network_access", "\"enabled\""),
+    ("windows_wsl_setup_acknowledged", "true"),
+];
+
+const PROVIDER_PRESET: &[(&str, &str)] = &[
+    ("name", "\"DonaAPI\""),
+    ("base_url", "\"https://donaapi.com/v1\""),
+    ("wire_api", "\"responses\""),
+    ("requires_openai_auth", "true"),
+];
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfigReport {
+    config_path: String,
+    changed_keys: Vec<String>,
+    added_keys: Vec<String>,
+    message: String,
+    localization: Option<ProviderLocalizationReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderLocalizationReport {
+    status: String,
+    message: String,
+    app_asar_path: Option<String>,
+    backup_path: Option<String>,
+    restart_required: bool,
+}
+
+impl From<ChinesePatchReport> for ProviderLocalizationReport {
+    fn from(report: ChinesePatchReport) -> Self {
+        Self {
+            status: report.status,
+            message: report.message,
+            app_asar_path: Some(report.app_asar_path),
+            backup_path: report.backup_path,
+            restart_required: report.restart_required,
+        }
+    }
+}
+
+fn line_for(key: &str, value: &str) -> String {
+    format!("{key} = {value}")
+}
+
+fn provider_config_keys(include_desktop_locale: bool) -> Vec<String> {
+    let mut keys = CODEX_ROOT_PRESET
+        .iter()
+        .map(|(key, _)| (*key).to_string())
+        .chain(
+            PROVIDER_PRESET
+                .iter()
+                .map(|(key, _)| format!("model_providers.donaapi.{key}")),
+        )
+        .collect::<Vec<_>>();
+    if include_desktop_locale {
+        keys.push("desktop.localeOverride".to_string());
+    }
+    keys
+}
+
+fn build_codex_config_preset(include_desktop_locale: bool) -> String {
+    let mut lines = CODEX_ROOT_PRESET
+        .iter()
+        .map(|(key, value)| line_for(key, value))
+        .collect::<Vec<String>>();
+
+    lines.push(String::new());
+    lines.push("[model_providers.donaapi]".to_string());
+    lines.extend(
+        PROVIDER_PRESET
+            .iter()
+            .map(|(key, value)| line_for(key, value)),
+    );
+    if include_desktop_locale {
+        lines.push(String::new());
+        lines.push("[desktop]".to_string());
+        lines.push("localeOverride = \"zh-CN\"".to_string());
+    }
+
+    format!("{}\n", lines.join("\n"))
+}
+
+fn write_codex_config_preset(include_desktop_locale: bool) -> Result<ProviderConfigReport, AppError> {
+    let codex_home = paths::codex_home_dir()
+        .ok_or_else(|| AppError::Internal("无法定位 Codex 数据目录".to_string()))?;
+    let path = codex_home.join("config.toml");
+    fs::create_dir_all(&codex_home)
+        .map_err(|e| AppError::Internal(format!("create Codex config dir: {e}")))?;
+    let original = fs::read_to_string(&path).unwrap_or_default();
+    let preset = build_codex_config_preset(include_desktop_locale);
+    let all_keys = provider_config_keys(include_desktop_locale);
+    let (changed_keys, added_keys) = if preset == original {
+        (Vec::new(), Vec::new())
+    } else if original.trim().is_empty() {
+        (Vec::new(), all_keys)
+    } else {
+        (all_keys, Vec::new())
+    };
+    if preset != original {
+        atomic_file::write_atomic(&path, preset.as_bytes())
+            .map_err(|e| AppError::Internal(format!("write Codex config.toml: {e}")))?;
+    }
+
+    Ok(ProviderConfigReport {
+        config_path: path.display().to_string(),
+        changed_keys,
+        added_keys,
+        message: "已重写 DonaAPI 模型配置。".to_string(),
+        localization: None,
+    })
+}
+
+fn failed_localization(message: String, app_asar_path: Option<String>) -> ProviderLocalizationReport {
+    ProviderLocalizationReport {
+        status: "failed".to_string(),
+        message,
+        app_asar_path,
+        backup_path: None,
+        restart_required: true,
+    }
+}
+
+fn apply_windows_localization(
+    installed: Option<InstalledWindowsCodex>,
+    manager_data_dir: &Path,
+) -> ProviderLocalizationReport {
+    let Some(installed) = installed else {
+        return ProviderLocalizationReport {
+            status: "not-installed".to_string(),
+            message: "未检测到 Windows ChatGPT，已跳过中文化；安装后可再次点击一键配置。"
+                .to_string(),
+            app_asar_path: None,
+            backup_path: None,
+            restart_required: false,
+        };
+    };
+    let install_root = PathBuf::from(&installed.path);
+    match patch_codex_chinese(&installed, manager_data_dir) {
+        Ok(report) => report.into(),
+        Err(err) => {
+            log::warn!(
+                "Windows Chinese patch failed root={} source={} error={err}",
+                install_root.display(),
+                installed.source
+            );
+            failed_localization(
+                format!("DonaAPI 配置已写入，但 Windows 中文化未完成：{err}"),
+                codex_win_engine::find_codex_app_asar(&install_root)
+                    .map(|path| path.display().to_string()),
+            )
+        }
+    }
+}
+
+fn close_windows_codex_before_config(
+    installed: Option<&InstalledWindowsCodex>,
+    manager_data_dir: &Path,
+) {
+    if let Err(err) = codex_win_engine::force_close_known_codex_processes() {
+        log::warn!("Windows one-click config could not force-close Codex by name error={err}");
+    }
+    if let Some(installed) = installed {
+        let install_root = PathBuf::from(&installed.path);
+        if let Err(err) = close_codex_gracefully_for_root(3, &install_root) {
+            log::warn!(
+                "Windows one-click config could not close ChatGPT root={} error={err}",
+                install_root.display()
+            );
+        }
+    }
+    if let Err(err) = close_patched_chinese_processes(manager_data_dir, 3) {
+        log::warn!("Windows one-click config could not close a Chinese copy error={err}");
+    }
+}
+
+#[tauri::command]
+pub async fn apply_provider_config(
+    state: State<'_, ManagerState>,
+) -> Result<ProviderConfigReport, CommandError> {
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
+    let windows = matches!(&state.target.os, OperatingSystem::Windows);
+    let windows_settings = windows.then(|| windows_domain_settings_for_persisted(&state));
+    let windows_install_mode = windows.then(windows_install_mode_for_settings);
+    let manager_data_dir =
+        paths::data_dir().unwrap_or_else(|| std::env::temp_dir().join("codex-app-manager"));
+    tauri::async_runtime::spawn_blocking(move || {
+        let installed = match windows_settings {
+            Some(settings) => resolve_windows_localization_target(
+                &settings,
+                windows_install_mode.as_deref().unwrap_or("msix"),
+            )?,
+            None => None,
+        };
+        if windows {
+            close_windows_codex_before_config(installed.as_ref(), &manager_data_dir);
+        }
+        let mut report = write_codex_config_preset(windows)?;
+        if windows {
+            let localization = apply_windows_localization(installed.clone(), &manager_data_dir);
+            report.message =
+                if matches!(localization.status.as_str(), "patched" | "already-patched") {
+                    let launch_target = installed.as_ref().and_then(|installed| {
+                        if installed.source == "msix" {
+                            codex_win_engine::patched_chinese_install(installed, &manager_data_dir)
+                        } else {
+                            Some(installed.clone())
+                        }
+                    });
+                    match launch_target.as_ref().map(codex_win_engine::launch_codex) {
+                        Some(Ok(())) => {
+                            "DonaAPI 配置与 Windows 中文化已完成，ChatGPT 已重新启动。".to_string()
+                        }
+                        Some(Err(err)) => {
+                            log::warn!(
+                                "launch ChatGPT after one-click configuration failed error={err}"
+                            );
+                            "DonaAPI 配置与 Windows 中文化已完成，请点击管理器中的“启动 Codex”。"
+                                .to_string()
+                        }
+                        None => {
+                            "DonaAPI 配置已写入，但未检测到可启动的中文副本，请再次点击一键配置。"
+                                .to_string()
+                        }
+                    }
+                } else {
+                    localization.message.clone()
+                };
+            report.localization = Some(localization);
+        }
+        Ok::<_, AppError>(report)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join one-click configuration: {e}")))?
+    .map_err(Into::into)
+}
+
+fn auto_stage_busy_report(enabled: bool, allow_metered: bool) -> WinAutoStageReport {
+    WinAutoStageReport {
+        enabled,
+        allow_metered,
+        attempted: false,
+        skipped: true,
+        reason: "operation-busy".to_string(),
+        stage: None,
+        capabilities: None,
+        notes: vec![
+            "Automatic Windows pre-download was skipped because another operation is running."
+                .to_string(),
+        ],
+    }
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn path_is_equal_or_child(path: &Path, root: &Path) -> bool {
+    let path = path_key(path);
+    let root = path_key(root);
+    path == root || path.starts_with(&format!("{root}\\"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendErrorPayload {
+    kind: String,
+    message: String,
+    stack: Option<String>,
+    component_stack: Option<String>,
+}
+
+#[cfg(windows)]
+fn protected_windows_roots() -> Vec<PathBuf> {
+    [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "ProgramData",
+        "SystemRoot",
+        "WINDIR",
+    ]
+    .into_iter()
+    .filter_map(std::env::var_os)
+    .filter(|value| !value.is_empty())
+    .map(PathBuf::from)
+    .collect()
+}
+
+#[cfg(not(windows))]
+fn protected_windows_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    path.parent().is_none() || (path.has_root() && path.components().count() <= 2)
+}
+
+fn is_protected_install_root(path: &Path) -> bool {
+    is_filesystem_root(path)
+        || protected_windows_roots()
+            .iter()
+            .any(|root| path_is_equal_or_child(path, root))
+}
+
+fn is_existing_codex_portable_root(path: &Path) -> bool {
+    // Identity-gated (entry exe + AppxManifest Identity == OpenAI.Codex): a
+    // directory that merely contains a ChatGPT.exe (e.g. an unpacked ChatGPT
+    // Classic) must not be treated as a replaceable Codex install.
+    codex_win_engine::detect_portable_install(path).is_some()
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool, AppError> {
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|e| AppError::Internal(format!("读取安装位置失败: {e}")))?;
+    Ok(entries.next().is_none())
+}
+
+/// Probe the operation the portable installer ultimately needs: create a
+/// non-empty child directory and atomically rename it beside the install root.
+/// A plain file write inside an existing install only proves file creation; it
+/// does not prove the parent grants directory replacement/delete-child rights.
+fn probe_install_parent_replace(path: &Path) -> Result<PathBuf, AppError> {
+    let requested_parent = path.parent().unwrap_or(path);
+    let probe_dir = nearest_existing_dir(requested_parent);
+    let probe_id = uuid::Uuid::new_v4();
+    let source = probe_dir.join(format!("{INSTALL_LOCATION_PROBE_PREFIX}{probe_id}-source"));
+    let destination =
+        probe_dir.join(format!("{INSTALL_LOCATION_PROBE_PREFIX}{probe_id}-destination"));
+
+    let probe_result = (|| -> std::io::Result<()> {
+        std::fs::create_dir(&source)?;
+        std::fs::write(source.join("probe"), b"ok")?;
+        codex_win_engine::rename_directory_with_retry(
+            "probe install parent directory rename",
+            &source,
+            &destination,
+        )?;
+        Ok(())
+    })();
+
+    // Validation must remain side-effect free. Clean both names because the
+    // probe can fail before or after the rename boundary.
+    let source_cleanup = if source.exists() {
+        codex_win_engine::remove_directory_all_with_retry(
+            "clean install parent source probe",
+            &source,
+        )
+    } else {
+        Ok(())
+    };
+    let destination_cleanup = if destination.exists() {
+        codex_win_engine::remove_directory_all_with_retry(
+            "clean install parent destination probe",
+            &destination,
+        )
+    } else {
+        Ok(())
+    };
+
+    let cleanup_result = source_cleanup.and(destination_cleanup);
+    match (probe_result, cleanup_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(probe_err), Ok(())) => {
+            return Err(AppError::Internal(format!(
+                "安装位置父目录不可写或不支持目录替换: {probe_err}"
+            )));
+        }
+        (Ok(()), Err(cleanup_err)) => {
+            return Err(AppError::Internal(format!(
+                "安装位置探测目录清理失败: {cleanup_err}"
+            )));
+        }
+        (Err(probe_err), Err(cleanup_err)) => {
+            return Err(AppError::Internal(format!(
+                "安装位置父目录不可写或不支持目录替换: {probe_err}; 探测目录清理也失败: {cleanup_err}"
+            )));
+        }
+    }
+    Ok(probe_dir)
+}
+
+fn validate_install_root_path(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Internal("安装位置不能为空".to_string()));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(AppError::Internal("安装位置必须是绝对路径".to_string()));
+    }
+    if path.exists() && !path.is_dir() {
+        return Err(AppError::Internal("安装位置必须是文件夹".to_string()));
+    }
+    if is_protected_install_root(&path) {
+        return Err(AppError::Internal(
+            "安装位置不能放在系统目录、管理员目录或磁盘根目录".to_string(),
+        ));
+    }
+    if path.exists() && !directory_is_empty(&path)? && !is_existing_codex_portable_root(&path) {
+        return Err(AppError::Internal(
+            "安装位置必须是空文件夹，或已有的 Codex 免安装版目录".to_string(),
+        ));
+    }
+    // Probe parent-level directory creation and rename WITHOUT creating the
+    // requested target itself. This mirrors the install swap and also gives us
+    // the same-volume ancestor for the free-space check.
+    let probe_dir = probe_install_parent_replace(&path)?;
+    if let Some(free) = available_space(&probe_dir)? {
+        if free < MIN_PORTABLE_FREE_SPACE_BYTES {
+            return Err(AppError::Internal(
+                "安装位置所在磁盘剩余空间不足".to_string(),
+            ));
+        }
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Nearest existing directory at or above `path`. Lets us probe writability and
+/// free space for a not-yet-created install root without creating it.
+fn nearest_existing_dir(path: &Path) -> PathBuf {
+    let mut cur = path;
+    loop {
+        if cur.is_dir() {
+            return cur.to_path_buf();
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => return cur.to_path_buf(),
+        }
+    }
+}
+
+fn install_root_from_picked_dir(raw: &str) -> Result<String, AppError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Internal("安装位置不能为空".to_string()));
+    }
+    let selected = PathBuf::from(trimmed);
+    if !selected.is_absolute() {
+        return Err(AppError::Internal("安装位置必须是绝对路径".to_string()));
+    }
+    if selected.exists() && !selected.is_dir() {
+        return Err(AppError::Internal("安装位置必须是文件夹".to_string()));
+    }
+    if is_filesystem_root(&selected) || is_protected_install_root(&selected) {
+        return validate_install_root_path(trimmed);
+    }
+    if selected.exists()
+        && selected.is_dir()
+        && !directory_is_empty(&selected)?
+        && !is_existing_codex_portable_root(&selected)
+    {
+        return validate_install_root_path(&selected.join("Codex").to_string_lossy());
+    }
+    validate_install_root_path(trimmed)
+}
+
+/// macOS-only: detect the installed Codex build, read the Sparkle appcast, and
+/// return an update plan (delta vs full). Read-only — performs no install.
+#[tauri::command]
+pub async fn mac_plan_update(
+    simulated_build: Option<u64>,
+) -> Result<MacUpdateReport, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    // Off the main thread: the appcast fetch (plus the auto-source official
+    // probe) is network IO — running it inline froze the webview, so the
+    // re-check spinner never animated ("卡一下没动画").
+    let network = mac_network_config_for_settings()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        plan_macos_update_with_network(simulated_build, &network)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// macOS-only: plan + download + size/EdDSA verify into staging. Non-destructive
+/// (no apply/swap). Runs the blocking download off the main thread.
+#[tauri::command]
+pub async fn mac_stage_update(
+    state: State<'_, ManagerState>,
+    simulated_build: Option<u64>,
+) -> Result<MacStageReport, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = begin_guard(&state, OperationKind::Update)?;
+    let network = mac_network_config_for_settings()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        stage_macos_update_with_network(simulated_build, &network)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// Locate the vendored Sparkle `BinaryDelta` tool, if present: an explicit
+/// `CODEX_BINARY_DELTA` override first (testing / a system Sparkle), then the app
+/// bundle's resources. Returns `None` when it isn't found — a *full*-package
+/// update doesn't need it, so resolution is best-effort and only the delta path
+/// errors on a genuine miss.
+fn resolve_binary_delta(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("CODEX_BINARY_DELTA") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    for rel in ["resources/BinaryDelta", "BinaryDelta"] {
+        if let Ok(res) = app
+            .path()
+            .resolve(rel, tauri::path::BaseDirectory::Resource)
+        {
+            if res.exists() {
+                return Some(res);
+            }
+        }
+    }
+    None
+}
+
+/// macOS-only **destructive** update: download+verify → reconstruct → codesign
+/// gate → graceful quit → atomic same-volume swap → health-check → relaunch (or
+/// rollback). Requires an explicit `confirm: true` from a UI second confirmation;
+/// runs the blocking work off the main thread.
+#[tauri::command]
+pub async fn mac_perform_update(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+    confirm: bool,
+    token: OperationToken,
+    expected_from_build: u64,
+    expected_to_build: u64,
+    expected_path: String,
+) -> Result<MacPerformReport, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    if !confirm {
+        return Err(
+            AppError::Internal("拒绝执行：破坏性更新必须带显式 confirm".to_string()).into(),
+        );
+    }
+    let op = DetachedGuard::validate(&state, token)?;
+    op.set_phase(OperationPhase::Preparing);
+    // Best-effort: a full-package update needs no delta tool, so don't reject the
+    // whole operation when it's absent — only the delta branch requires it.
+    let binary_delta = resolve_binary_delta(&app);
+    // The user confirmed a specific target; the backend re-verifies reality still
+    // matches before the destructive swap (guards a TOCTOU vs appcast refresh /
+    // Codex self-update between confirm and execute).
+    let expected = PerformExpectation {
+        from_build: expected_from_build,
+        to_build: expected_to_build,
+        install_path: expected_path,
+    };
+    let progress_app = app.clone();
+    let network = mac_network_config_for_settings()?;
+    let ops = op.operations();
+    let phase_token = op.token_clone();
+    let progress_token = phase_token.clone();
+    let progress_ops = ops.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = move |p: crate::app::mac_update::DownloadProgress| {
+            if let Some(token) = progress_token.as_ref() {
+                emit_op_download_progress(
+                    &progress_app,
+                    &progress_ops,
+                    token,
+                    "mac://download-progress",
+                    p.downloaded,
+                    p.total,
+                    p.source,
+                );
+            } else {
+                let _ = progress_app.emit("mac://download-progress", p);
+            }
+        };
+        let phase_hook = |phase: OperationPhase| {
+            if let Some(token) = phase_token.as_ref() {
+                let _ = ops.set_phase(token, phase);
+            }
+        };
+        perform_macos_update_with_network_and_phase(
+            binary_delta,
+            expected,
+            &report,
+            &network,
+            Some(&phase_hook),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// macOS-only: classify the installed Codex (managed / external / none).
+#[tauri::command]
+pub fn mac_status(state: State<'_, ManagerState>) -> Result<MacInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Macos) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(crate::app::mac_update::mac_install_status())
+}
+
+/// macOS-only: adopt the detected external install (after explicit user consent).
+#[tauri::command]
+pub fn mac_adopt(state: State<'_, ManagerState>) -> Result<MacInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Macos) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = begin_guard(&state, OperationKind::Adopt)?;
+    crate::app::mac_update::mac_adopt().map_err(Into::into)
+}
+
+/// macOS-only: let the user pick an existing Codex install and validate it.
+/// The bundle may be named Codex.app or (post-rebrand) ChatGPT.app — validation
+/// is by CFBundleIdentifier, so ChatGPT Classic is rejected with a clear error.
+#[tauri::command]
+pub async fn mac_pick_existing_install(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<Option<InstalledCodex>, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Macos) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let start_dir = mac_existing_install_start_dir();
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择 Codex 应用（Codex.app 或 ChatGPT.app）")
+            .set_directory(start_dir)
+            .blocking_pick_file()
+            .map(|path| {
+                path.into_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(|e| AppError::Internal(format!("读取选择的应用失败: {e}")))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    selected
+        .as_deref()
+        .map(|path| detect_macos_install_at_path(Path::new(path)))
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// macOS-only: adopt the user-selected Codex.app path.
+#[tauri::command]
+pub fn mac_adopt_path(
+    state: State<'_, ManagerState>,
+    path: String,
+) -> Result<MacInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Macos) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = begin_guard(&state, OperationKind::Adopt)?;
+    adopt_macos_path(Path::new(&path)).map_err(Into::into)
+}
+
+/// macOS-only: open the installed Codex.app (explicit 〔打开 Codex〕 action).
+#[tauri::command]
+pub async fn mac_launch_codex(_state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    tauri::async_runtime::spawn_blocking(crate::app::mac_update::launch_codex)
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
+/// macOS-only: fresh-install the latest Codex (full package) into /Applications.
+/// Runs the blocking download/verify/install off the main thread.
+#[tauri::command]
+pub async fn mac_install(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<MacInstallStatus, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let op = begin_guard(&state, OperationKind::Install)?;
+    let token = op.token().clone();
+    let ops = state.operations.clone();
+    let _ = ops.set_phase(&token, OperationPhase::Preparing);
+    let network = mac_network_config_for_settings()?;
+    let progress_token = token.clone();
+    let progress_ops = ops.clone();
+    let phase_token = token.clone();
+    let phase_ops = ops.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = move |p: crate::app::mac_update::DownloadProgress| {
+            emit_op_download_progress(
+                &app,
+                &progress_ops,
+                &progress_token,
+                "mac://download-progress",
+                p.downloaded,
+                p.total,
+                p.source,
+            );
+        };
+        let phase_hook = |phase: OperationPhase| {
+            let _ = phase_ops.set_phase(&phase_token, phase);
+        };
+        install_macos_with_network_and_phase(&report, &network, Some(&phase_hook))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// macOS-only: request pausing an active package download.
+/// Partial bytes are left in place for the next resume-capable run.
+#[tauri::command]
+pub fn mac_pause_download(
+    state: State<'_, ManagerState>,
+    operation_id: String,
+) -> Result<bool, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(state
+        .operations
+        .request_pause(&OperationToken(operation_id), pause_macos_download))
+}
+
+/// macOS-only: request cancellation of an active package download.
+/// Partial bytes are discarded.
+#[tauri::command]
+pub fn mac_cancel_download(
+    state: State<'_, ManagerState>,
+    operation_id: String,
+) -> Result<bool, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(state
+        .operations
+        .request_cancellation(&OperationToken(operation_id), cancel_macos_download))
+}
+
+/// macOS-only: discard a PAUSED download. After a pause the curl process is gone
+/// but its `.part` is still cached for resume; this drops it when the user
+/// cancels from the paused state instead of resuming.
+#[tauri::command]
+pub fn mac_discard_download() -> Result<(), CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    discard_macos_download().map_err(Into::into)
+}
+
+/// Windows-only: detect installed Codex, read mirror manifest/checksums, probe
+/// sideload capabilities, and return the preferred update path. Read-only.
+#[tauri::command]
+pub async fn win_plan_update(
+    state: State<'_, ManagerState>,
+) -> Result<WinUpdateReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let endpoints = windows_endpoints_for_settings(&state)?;
+    let settings = windows_domain_settings_for_persisted(&state);
+    let install_mode = windows_install_mode_for_settings();
+    let network = win_network_config_for_settings()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        plan_windows_update_with_install_mode_and_network(
+            &endpoints,
+            &settings,
+            &install_mode,
+            &network,
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// Windows-only: plan + download + size/SHA256/AuthentiCode/AppxManifest gates
+/// into staging. Non-destructive (no install yet).
+#[tauri::command]
+pub async fn win_stage_update(
+    state: State<'_, ManagerState>,
+) -> Result<WinStageReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = begin_guard(&state, OperationKind::Update)?;
+    let endpoints = windows_endpoints_for_settings(&state)?;
+    let settings = windows_domain_settings_for_persisted(&state);
+    let install_mode = windows_install_mode_for_settings();
+    let network = win_network_config_for_settings()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        stage_windows_update_with_install_mode_and_network(
+            &endpoints,
+            &settings,
+            &install_mode,
+            &|_| {},
+            &network,
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// Read persisted app settings (update source + general).
+#[tauri::command]
+pub fn get_settings(state: State<'_, ManagerState>) -> Result<PersistedAppSettings, CommandError> {
+    let mut settings = PersistedAppSettings::load();
+    normalize_settings_for_target(&mut settings, &state.target);
+    Ok(settings)
+}
+
+/// Persist app settings. `signed_only` is forced on regardless of input.
+#[tauri::command]
+pub fn set_settings(
+    state: State<'_, ManagerState>,
+    settings: PersistedAppSettings,
+) -> Result<PersistedAppSettings, CommandError> {
+    let mut s = settings;
+    s.normalize();
+    normalize_settings_for_target(&mut s, &state.target);
+    // After normalize(), empty custom source/proxy is coerced away. Any remaining
+    // Custom mode must carry a non-empty, validated URL so disk matches runtime.
+    if s.source == UpdateSource::Custom {
+        s.custom_url = validate_custom_source(&s.custom_url).map_err(|e| {
+            let host = redact_url(&s.custom_url);
+            log::warn!("url_guard rejected custom source reason={e} host={host}");
+            AppError::Engine(e.to_string())
+        })?;
+    }
+    if s.proxy_mode == ProxyMode::Custom {
+        s.custom_proxy_url = validated_custom_proxy_for_settings(&s.custom_proxy_url, "settings")?;
+    }
+    let previous = PersistedAppSettings::load();
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
+    if previous.disable_codex_self_updates != s.disable_codex_self_updates {
+        crate::app::codex_self_update::sync_setting(s.disable_codex_self_updates)?;
+    }
+    s.save()?;
+    refresh_config_health(&state);
+    log::info!(
+        "saved settings source={} windows_install_mode={} proxy_mode={} disable_codex_self_updates={}",
+        s.source.as_str(),
+        s.windows_install_mode,
+        s.proxy_mode.as_str(),
+        s.disable_codex_self_updates
+    );
+    Ok(s)
+}
+
+#[tauri::command]
+pub fn get_config_health(state: State<'_, ManagerState>) -> ConfigHealth {
+    // Always re-read from disk so the UI sees post-restore/reset truth, not a
+    // stale snapshot taken at process start.
+    refresh_config_health(&state)
+}
+
+#[tauri::command]
+pub fn restore_config_backup(
+    state: State<'_, ManagerState>,
+    which: String,
+) -> Result<ConfigHealth, CommandError> {
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
+    let path = config_path(which.as_str())?;
+    let backup = atomic_file::backup_path(&path);
+    if !backup.exists() {
+        return Err(AppError::Internal(format!("找不到 {which} 的 .bak 备份")).into());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AppError::Internal(format!("create data dir: {e}")))?;
+    }
+    let current_tmp = path.with_extension(format!("restore-current-{}", std::process::id()));
+    if path.exists() {
+        std::fs::rename(&path, &current_tmp)
+            .map_err(|e| AppError::Internal(format!("move current config aside: {e}")))?;
+    }
+    if let Err(err) = std::fs::rename(&backup, &path) {
+        if current_tmp.exists() {
+            let _ = std::fs::rename(&current_tmp, &path);
+        }
+        return Err(AppError::Internal(format!("restore config backup: {err}")).into());
+    }
+    if current_tmp.exists() {
+        let _ = std::fs::remove_file(current_tmp);
+    }
+    log::info!("restored config backup which={which}");
+    // Re-read + re-verify; never claim success without a fresh health probe.
+    let health = refresh_config_health(&state);
+    let status = match which.as_str() {
+        "settings" => health.settings_status.as_str(),
+        "provenance" => health.provenance_status.as_str(),
+        _ => "ok",
+    };
+    if status == "corrupt" {
+        return Err(AppError::Internal(format!(
+            "已从 .bak 还原 {which}，但重新读取仍判定为损坏"
+        ))
+        .into());
+    }
+    Ok(health)
+}
+
+#[tauri::command]
+pub fn reset_config(
+    state: State<'_, ManagerState>,
+    which: String,
+) -> Result<ConfigHealth, CommandError> {
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
+    match which.as_str() {
+        "settings" => {
+            let mut settings = PersistedAppSettings::default();
+            normalize_settings_for_target(&mut settings, &state.target);
+            crate::app::codex_self_update::sync_setting(settings.disable_codex_self_updates)?;
+            settings.save()?;
+        }
+        "provenance" => {
+            ProvenanceStore::default().save()?;
+        }
+        _ => {
+            return Err(
+                AppError::Internal("配置类型必须是 settings 或 provenance".to_string()).into(),
+            )
+        }
+    }
+    log::info!("reset config which={which}");
+    let health = refresh_config_health(&state);
+    let status = match which.as_str() {
+        "settings" => health.settings_status.as_str(),
+        "provenance" => health.provenance_status.as_str(),
+        _ => "ok",
+    };
+    if status == "corrupt" {
+        return Err(AppError::Internal(format!(
+            "已重置 {which}，但重新读取仍判定为损坏"
+        ))
+        .into());
+    }
+    Ok(health)
+}
+
+/// Retry only failed ancillary steps after a partial install/uninstall.
+/// Never re-runs full install or uninstall of the app itself.
+///
+/// `purge_user_data` is destructive (deletes `~/.codex`): it requires the same
+/// explicit confirm + armed uninstall token as a full uninstall, so it cannot
+/// be one-clicked from a recovery CTA.
+#[tauri::command]
+pub fn retry_ancillary(
+    state: State<'_, ManagerState>,
+    request: AncillaryRetryRequest,
+    confirm: Option<bool>,
+    token: Option<OperationToken>,
+) -> Result<AncillaryRetryReport, CommandError> {
+    let actions = &request.actions;
+    let path = request.path.as_deref();
+    let purge = request.purge_user_data
+        && actions
+            .iter()
+            .any(|a| a == crate::app::operation_outcome::recovery::PURGE_USER_DATA);
+    // Hold either a scoped adopt lock or a validated destructive uninstall token
+    // for the duration of the retry. Drop ends the token/lock (fields unread on purpose).
+    #[allow(dead_code)]
+    enum RetryGuard {
+        Scoped(OperationGuard),
+        Detached(DetachedGuard),
+    }
+    let _guard: RetryGuard = if purge {
+        if confirm != Some(true) {
+            return Err(AppError::Internal(
+                "清除用户数据需要二次确认（confirm=true）".to_string(),
+            )
+            .into());
+        }
+        let token = token.ok_or_else(|| {
+            AppError::Internal(
+                "清除用户数据需要破坏性令牌（先 arm_destructive uninstall）".to_string(),
+            )
+        })?;
+        let guard =
+            DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
+        RetryGuard::Detached(guard)
+    } else {
+        RetryGuard::Scoped(begin_guard(&state, OperationKind::Adopt)?)
+    };
+    match state.target.os {
+        OperatingSystem::Macos => {
+            retry_macos_ancillary(actions, path, purge).map_err(Into::into)
+        }
+        OperatingSystem::Windows => {
+            let settings = windows_domain_settings_for_persisted(&state);
+            retry_windows_ancillary(&settings, actions, path, purge).map_err(Into::into)
+        }
+        _ => Err(AppError::UnsupportedPlatform.into()),
+    }
+}
+
+#[tauri::command]
+pub fn begin_operation(
+    state: State<'_, ManagerState>,
+    kind: OperationKind,
+) -> Result<OperationToken, CommandError> {
+    state
+        .operations
+        .begin_detached(kind)
+        .map_err(|err| {
+            log::warn!(
+                "begin_operation rejected kind={} error={err}",
+                kind.as_str()
+            );
+            AppError::from(err)
+        })
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn arm_destructive(
+    state: State<'_, ManagerState>,
+    kind: OperationKind,
+) -> Result<OperationToken, CommandError> {
+    if !matches!(kind, OperationKind::Update | OperationKind::Uninstall) {
+        return Err(
+            AppError::Internal("仅 update/uninstall 操作可使用破坏性令牌".to_string()).into(),
+        );
+    }
+    state
+        .operations
+        .begin_detached(kind)
+        .map_err(|err| {
+            log::warn!(
+                "arm_destructive rejected kind={} error={err}",
+                kind.as_str()
+            );
+            AppError::from(err)
+        })
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn end_operation(
+    state: State<'_, ManagerState>,
+    token: OperationToken,
+) -> Result<(), CommandError> {
+    state
+        .operations
+        .end(token)
+        .map_err(AppError::from)
+        .map_err(Into::into)
+}
+
+/// Current same-process operation lease, if any. Used by the frontend on mount
+/// to reattach progress/phase UI after a renderer reload without re-arming work.
+#[tauri::command]
+pub fn get_operation_snapshot(
+    state: State<'_, ManagerState>,
+) -> Result<Option<OperationSnapshot>, CommandError> {
+    Ok(state.operations.snapshot())
+}
+
+/// Token-keyed terminal evidence for a renderer that lost the original invoke
+/// promise. `failed-before-commit` and `rolled-back` prove that retrying a fresh
+/// install is safe; unresolved committing/finishing failures remain outcome-unknown.
+#[tauri::command]
+pub fn get_operation_completion(
+    state: State<'_, ManagerState>,
+    token: OperationToken,
+) -> Result<Option<OperationCompletion>, CommandError> {
+    Ok(state.operations.completion(&token))
+}
+
+/// The user confirmed quitting from the close dialog — flag it and exit so the
+/// CloseRequested / ExitRequested guards stop intercepting and let it go.
+/// Still refuses when the backend is in a non-interruptible install phase.
+#[tauri::command]
+pub fn confirm_quit(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    let confirm_close = crate::app::settings_store::AppSettings::load().confirm_close;
+    // Decide and arm exit under the SAME operation mutex used by phase changes.
+    // If the worker already reached commit this returns Block. Otherwise both app
+    // abort latches and force_quit are set before it can cross that boundary, so
+    // the final pre-commit checkpoint observes the cancellation.
+    let policy = state.operations.prepare_quit(confirm_close, true, || {
+        let _ = cancel_macos_download();
+        let _ = cancel_windows_download();
+        state
+            .force_quit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    if let QuitPolicy::Block {
+        phase,
+        reason_code,
+        reason,
+        kind,
+    } = &policy
+    {
+        log::warn!(
+            "confirm_quit blocked phase={} reason_code={reason_code} kind={:?} reason={reason}",
+            phase.as_str(),
+            kind
+        );
+        crate::dispatch_shell_event(
+            &app,
+            crate::app::shell::ShellEvent::QuitBlocked(policy.clone()),
+        );
+        return Err(AppError::Busy(reason.clone()).into());
+    }
+    crate::exit_after_confirm(&app);
+    Ok(())
+}
+
+/// Windows-only: return the current user's default portable install root.
+#[tauri::command]
+pub fn win_default_install_root(state: State<'_, ManagerState>) -> Result<String, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(PersistedAppSettings::default().install_root)
+}
+
+/// Windows-only: open a system folder picker for the portable install root.
+#[tauri::command]
+pub async fn win_pick_install_dir(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<Option<String>, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let start_dir = dialog_start_dir(&PersistedAppSettings::load().install_root);
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择 Codex 安装位置")
+            .set_directory(start_dir)
+            .blocking_pick_folder()
+            .map(|path| {
+                path.into_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(|e| AppError::Internal(format!("读取选择的文件夹失败: {e}")))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    match selected {
+        Some(path) => tauri::async_runtime::spawn_blocking(move || {
+            install_root_from_picked_dir(&path).map(Some)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into),
+        None => Ok(None),
+    }
+}
+
+/// Windows-only: let the user pick an existing portable/self-extracted Codex directory.
+#[tauri::command]
+pub async fn win_pick_existing_install(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+) -> Result<Option<InstalledWindowsCodex>, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let start_dir = dialog_start_dir(&PersistedAppSettings::load().install_root);
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择已安装的 Codex 位置")
+            .set_directory(start_dir)
+            .blocking_pick_folder()
+            .map(|path| {
+                path.into_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(|e| AppError::Internal(format!("读取选择的文件夹失败: {e}")))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    selected
+        .as_deref()
+        .map(|path| detect_windows_install_at_path(Path::new(path)))
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// Windows-only: adopt the user-selected Codex directory.
+#[tauri::command]
+pub fn win_adopt_path(
+    state: State<'_, ManagerState>,
+    path: String,
+) -> Result<WinInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = begin_guard(&state, OperationKind::Adopt)?;
+    let settings = windows_domain_settings_for_persisted(&state);
+    adopt_windows_path(&settings, Path::new(&path)).map_err(Into::into)
+}
+
+/// Windows-only: persist a validated portable install root.
+#[tauri::command]
+pub async fn win_set_install_root(
+    state: State<'_, ManagerState>,
+    path: String,
+) -> Result<PersistedAppSettings, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
+    let install_root =
+        tauri::async_runtime::spawn_blocking(move || validate_install_root_path(&path))
+            .await
+            .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    let mut settings = PersistedAppSettings::load();
+    settings.install_root = install_root;
+    settings.normalize();
+    settings.save()?;
+    let path = &settings.install_root;
+    log::info!("set Windows install root path={path}");
+    Ok(settings)
+}
+
+/// Windows-only: reset the remembered portable install root to the per-user default.
+#[tauri::command]
+pub async fn win_reset_install_root(
+    state: State<'_, ManagerState>,
+) -> Result<PersistedAppSettings, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = begin_guard(&state, OperationKind::SetInstallRoot)?;
+    let default_install_root = PersistedAppSettings::default().install_root;
+    let install_root = tauri::async_runtime::spawn_blocking(move || {
+        validate_install_root_path(&default_install_root)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    let mut settings = PersistedAppSettings::load();
+    settings.install_root = install_root;
+    settings.normalize();
+    settings.save()?;
+    let path = &settings.install_root;
+    log::info!("reset Windows install root path={path}");
+    Ok(settings)
+}
+
+/// macOS-only **destructive**: uninstall Codex. Requires explicit `confirm`.
+/// `keep_codex_home` defaults true at the UI — `~/.codex` survives unless the
+/// user opts out. Runs the blocking work off the main thread.
+#[tauri::command]
+pub async fn mac_uninstall(
+    state: State<'_, ManagerState>,
+    confirm: bool,
+    token: OperationToken,
+    keep_codex_home: bool,
+) -> Result<MacUninstallReport, CommandError> {
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    if !confirm {
+        return Err(AppError::Internal("拒绝执行：卸载必须带显式 confirm".to_string()).into());
+    }
+    let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
+    // Uninstall has no resumable cancellation protocol. Treat the whole worker
+    // as point-of-no-return so every native/window quit path blocks until the
+    // removal and ancillary bookkeeping have settled.
+    tauri::async_runtime::spawn_blocking(move || uninstall_macos(keep_codex_home))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
+/// Windows-only: background pre-download guard. It stages only when the user
+/// enabled auto download and the current network passes the metered policy.
+#[tauri::command]
+pub async fn win_auto_stage_update(
+    state: State<'_, ManagerState>,
+    enabled: bool,
+    allow_metered: bool,
+) -> Result<WinAutoStageReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = if enabled {
+        match state.operations.begin(OperationKind::Update) {
+            Ok(guard) => Some(guard),
+            Err(OperationError::BusySameProcess(_) | OperationError::BusyOtherProcess) => {
+                return Ok(auto_stage_busy_report(enabled, allow_metered));
+            }
+            Err(err) => return Err(AppError::from(err).into()),
+        }
+    } else {
+        None
+    };
+    let endpoints = windows_endpoints_for_settings(&state)?;
+    let settings = windows_domain_settings_for_persisted(&state);
+    let install_mode = windows_install_mode_for_settings();
+    let network = win_network_config_for_settings()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        auto_stage_windows_update_with_install_mode_and_network(
+            &endpoints,
+            &settings,
+            enabled,
+            allow_metered,
+            &install_mode,
+            &network,
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+/// Windows-only: request pausing an active background/manual download.
+/// Partial bytes are left in place for the next resume-capable staging run.
+#[tauri::command]
+pub fn win_pause_download(
+    state: State<'_, ManagerState>,
+    operation_id: String,
+) -> Result<bool, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(state
+        .operations
+        .request_pause(&OperationToken(operation_id), pause_windows_download))
+}
+
+/// Windows-only: request cancellation of an active background/manual download.
+/// Partial bytes are discarded.
+#[tauri::command]
+pub fn win_cancel_download(
+    state: State<'_, ManagerState>,
+    operation_id: String,
+) -> Result<bool, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    Ok(state
+        .operations
+        .request_cancellation(&OperationToken(operation_id), cancel_windows_download))
+}
+
+/// Windows-only: discard a PAUSED download. Drops the cached `.part` left for
+/// resume when the user cancels from the paused state instead of resuming.
+#[tauri::command]
+pub fn win_discard_download(state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    discard_windows_download().map_err(Into::into)
+}
+
+/// Whether "launch at login" is currently enabled (off by default).
+#[tauri::command]
+pub fn get_autostart(app: tauri::AppHandle) -> Result<bool, CommandError> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| AppError::Internal(format!("autostart: {e}")).into())
+}
+
+/// Enable/disable launch at login. The user opts in explicitly from Settings.
+#[tauri::command]
+pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), CommandError> {
+    let mgr = app.autolaunch();
+    let result = if enabled { mgr.enable() } else { mgr.disable() };
+    result.map_err(|e| AppError::Internal(format!("autostart: {e}")).into())
+}
+
+/// Switch the main window between the compact dashboard and the expanded
+/// workbench. `width`/`height` are the frontend-remembered expanded size
+/// (logical px); the echoed report carries what was actually applied after
+/// clamping, so the frontend persists reality rather than the request.
+#[tauri::command]
+pub fn set_window_mode(
+    app: tauri::AppHandle,
+    mode: WindowMode,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<WindowModeReport, CommandError> {
+    window_mode::apply_window_mode(&app, mode, width, height).map_err(Into::into)
+}
+
+/// Open an external http(s) URL in the user's default browser. Restricted to
+/// http(s) so it can't be coerced into launching arbitrary local handlers.
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), CommandError> {
+    validate_external_http_url(&url)?;
+    let host = redact_url(&url);
+    log::info!("open external URL host={host}");
+    open_external_url(&url).map_err(|e| AppError::Internal(format!("打开链接失败: {e}")).into())
+}
+
+#[tauri::command]
+pub fn get_diagnostics(app: tauri::AppHandle, state: State<'_, ManagerState>) -> Diagnostics {
+    log::info!("collecting diagnostics");
+    crate::app::diagnostics::collect_diagnostics(&app, &state)
+}
+
+#[tauri::command]
+pub fn open_logs_dir(app: tauri::AppHandle) -> Result<(), CommandError> {
+    let dir = crate::app::logging::logs_dir(&app)
+        .ok_or_else(|| AppError::Internal("无法定位日志目录".to_string()))?;
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.display();
+    log::info!("open logs dir path={path}");
+    open_dir_platform(&dir).map_err(|e| AppError::Internal(format!("打开日志目录失败: {e}")).into())
+}
+
+#[cfg(target_os = "macos")]
+fn open_dir_platform(dir: &Path) -> Result<(), String> {
+    std::process::Command::new("/usr/bin/open")
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn open_dir_platform(dir: &Path) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let operation: Vec<u16> = OsStr::new("open").encode_wide().chain([0]).collect();
+    let target: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result <= 32 {
+        Err(format!("ShellExecuteW failed with code {result}"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn open_dir_platform(dir: &Path) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn open_codex_home() -> Result<(), CommandError> {
+    let dir = paths::codex_home_dir()
+        .ok_or_else(|| AppError::Internal("无法定位 Codex 数据目录".to_string()))?;
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.display();
+    log::info!("open Codex home path={path}");
+    open_dir_platform(&dir)
+        .map_err(|e| AppError::Internal(format!("打开 Codex 数据目录失败: {e}")).into())
+}
+
+#[tauri::command]
+pub fn log_frontend_error(payload: FrontendErrorPayload) {
+    let kind = single_line(&payload.kind);
+    let message = single_line(&payload.message);
+    let stack = payload
+        .stack
+        .as_deref()
+        .map(single_line)
+        .unwrap_or_else(|| "none".to_string());
+    let component_stack = payload
+        .component_stack
+        .as_deref()
+        .map(single_line)
+        .unwrap_or_else(|| "none".to_string());
+    log::error!(
+        "frontend error kind={kind} message={message} stack={stack} component_stack={component_stack}"
+    );
+}
+
+fn single_line(value: &str) -> String {
+    value.replace('\r', "\\r").replace('\n', "\\n")
+}
+
+fn validate_external_http_url(url: &str) -> Result<(), AppError> {
+    if url
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\')
+    {
+        return Err(AppError::Internal("链接包含非法字符".to_string()));
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Err(AppError::Internal("仅支持 http(s) 链接".to_string()));
+    };
+    if !(scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")) {
+        return Err(AppError::Internal("仅支持 http(s) 链接".to_string()));
+    }
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_matches('.');
+    if host.is_empty() || host.contains('@') {
+        return Err(AppError::Internal("链接缺少有效主机名".to_string()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_external_url(url: &str) -> Result<(), String> {
+    std::process::Command::new("/usr/bin/open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn open_external_url(url: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let operation: Vec<u16> = OsStr::new("open").encode_wide().chain([0]).collect();
+    let target: Vec<u16> = OsStr::new(url).encode_wide().chain([0]).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result <= 32 {
+        Err(format!("ShellExecuteW failed with code {result}"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn open_external_url(url: &str) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod open_url_tests {
+    use super::validate_external_http_url;
+
+    #[test]
+    fn accepts_http_urls_with_query_delimiters() {
+        assert!(validate_external_http_url("https://example.com/a?x=1&y=2").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_http_and_shell_sensitive_url_shapes() {
+        for url in [
+            "file:///C:/Windows/notepad.exe",
+            "https://example.com/a b",
+            "https://example.com\\evil",
+            "https://user@example.com/",
+            "https://",
+        ] {
+            assert!(
+                validate_external_http_url(url).is_err(),
+                "{url} should be rejected"
+            );
+        }
+    }
+}
+
+/// Windows-only: classify the installed Codex (managed / external / none).
+///
+/// Async + `spawn_blocking` so AppX / PowerShell status probes cannot freeze the
+/// WebView when enterprise policy or a hung AppX service stalls detection.
+#[tauri::command]
+pub async fn win_status(state: State<'_, ManagerState>) -> Result<WinInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let settings = windows_domain_settings_for_persisted(&state);
+    tauri::async_runtime::spawn_blocking(move || win_install_status(&settings))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))
+        .map_err(Into::into)
+}
+
+/// Windows-only: adopt the detected external install (after explicit consent).
+///
+/// Async + `spawn_blocking` so filesystem / provenance work stays off the UI thread.
+#[tauri::command]
+pub async fn win_adopt(state: State<'_, ManagerState>) -> Result<WinInstallStatus, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let _op = begin_guard(&state, OperationKind::Adopt)?;
+    let settings = windows_domain_settings_for_persisted(&state);
+    tauri::async_runtime::spawn_blocking(move || adopt_windows_install(&settings))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
+/// Async + `spawn_blocking` so PowerShell AUMID activation (or portable spawn)
+/// cannot freeze the WebView while the OS is cold-starting Codex. Errors still
+/// surface to the UI after the blocking work finishes.
+#[tauri::command]
+pub async fn win_launch_codex(state: State<'_, ManagerState>) -> Result<(), CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    let settings = windows_domain_settings_for_persisted(&state);
+    tauri::async_runtime::spawn_blocking(move || crate::app::win_update::launch_codex(&settings))
+        .await
+        .map_err(|e| AppError::Internal(format!("join: {e}")))?
+        .map_err(Into::into)
+}
+
+/// Windows-only: guarded execution. Requires explicit confirmation, stages and
+/// verifies the MSIX first, then attempts Add-AppxPackage without elevation or
+/// policy changes. Reports portable fallback need transparently.
+#[tauri::command]
+pub async fn win_perform_update(
+    app: tauri::AppHandle,
+    state: State<'_, ManagerState>,
+    confirm: bool,
+    token: OperationToken,
+    install_root: Option<String>,
+    expected: Option<WinPerformExpectation>,
+) -> Result<WinPerformReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    if !confirm {
+        return Err(
+            AppError::Internal("拒绝执行：Windows 更新必须带显式 confirm".to_string()).into(),
+        );
+    }
+    let mut op = DetachedGuard::validate_tracked(&state, token)?;
+    op.set_phase(OperationPhase::Preparing);
+    let endpoints = windows_endpoints_for_settings(&state)?;
+    let mut settings = windows_domain_settings_for_persisted(&state);
+    // Validate (but don't yet persist) an explicitly chosen install root: it
+    // only becomes the remembered default after the install actually succeeds,
+    // so a failed or cancelled attempt never changes the user's saved location.
+    let pending_install_root = match install_root {
+        Some(raw) => {
+            let validated =
+                tauri::async_runtime::spawn_blocking(move || validate_install_root_path(&raw))
+                    .await
+                    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+            settings.install_root = validated.clone();
+            Some(validated)
+        }
+        None => None,
+    };
+    let install_mode = windows_install_mode_for_settings();
+    let network = win_network_config_for_settings()?;
+    let progress_app = app.clone();
+    let ops = op.operations();
+    let phase_token = op.token_clone();
+    let progress_token = phase_token.clone();
+    let progress_ops = ops.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let report = move |p: WinDownloadProgress| {
+            if let Some(token) = progress_token.as_ref() {
+                emit_op_download_progress(
+                    &progress_app,
+                    &progress_ops,
+                    token,
+                    "win://download-progress",
+                    p.downloaded,
+                    p.total,
+                    p.source,
+                );
+            } else {
+                let _ = progress_app.emit("win://download-progress", p);
+            }
+        };
+        let phase_hook = |phase: OperationPhase| {
+            if let Some(token) = phase_token.as_ref() {
+                let _ = ops.set_phase(token, phase);
+            }
+        };
+        let evidence_hook = |evidence: OperationEvidence| {
+            if let Some(token) = phase_token.as_ref() {
+                let result = match evidence {
+                    OperationEvidence::MutationStarted => ops.mark_mutation_started(token),
+                    OperationEvidence::MutationRolledBack => {
+                        ops.mark_mutation_rolled_back(token)
+                    }
+                    OperationEvidence::OutcomeAmbiguous => ops.mark_outcome_ambiguous(token),
+                };
+                if let Err(error) = result {
+                    log::error!("failed to record Windows operation evidence: {error}");
+                }
+            }
+        };
+        perform_windows_update_with_install_mode_network_and_phase(
+            &endpoints,
+            &settings,
+            confirm,
+            &install_mode,
+            expected,
+            &report,
+            &network,
+            Some(&phase_hook),
+            Some(&evidence_hook),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))??;
+    if let Some(root) = pending_install_root {
+        if report.success {
+            let mut saved = PersistedAppSettings::load();
+            saved.install_root = root;
+            saved.normalize();
+            saved.save()?;
+        }
+    }
+    if report.success {
+        // The staged MSIX was consumed by the install — drop the cache. A failed
+        // or cancelled perform leaves it so the next run (or a resume) reuses the
+        // partial/full artifact instead of re-downloading. `stage`/`auto_stage`
+        // never clear it: they're pre-downloads whose whole point is to be reused.
+        // Best-effort: the stale sweep reclaims a leftover, so a cleanup failure
+        // must not turn a successful install into an error.
+        let _ = crate::app::staging::clear_download_cache();
+    }
+    op.mark_succeeded();
+    Ok(report)
+}
+
+/// Windows-only: guarded uninstall. Only removes installs recorded as managed
+/// by this app. User data is preserved unless `purge_user_data` is true.
+#[tauri::command]
+pub async fn win_uninstall(
+    state: State<'_, ManagerState>,
+    confirm: bool,
+    token: OperationToken,
+    purge_user_data: bool,
+) -> Result<WinUninstallReport, CommandError> {
+    if !matches!(state.target.os, OperatingSystem::Windows) {
+        return Err(AppError::UnsupportedPlatform.into());
+    }
+    if !confirm {
+        return Err(
+            AppError::Internal("拒绝执行：Windows 卸载必须带显式 confirm".to_string()).into(),
+        );
+    }
+    let _op = DetachedGuard::validate_with_phase(&state, token, OperationPhase::Committing)?;
+    // Remove-AppxPackage / portable tree removal must not be killed mid-call.
+    let settings = windows_domain_settings_for_persisted(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        uninstall_windows_codex(&settings, confirm, purge_user_data)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("join: {e}")))?
+    .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_codex_config_preset, install_root_from_picked_dir,
+        provider_config_keys, validate_install_root_path, validated_custom_proxy_for_settings,
+        INSTALL_LOCATION_PROBE_PREFIX,
+    };
+    use std::fs;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn settings_custom_proxy_requires_a_url() {
+        let err = validated_custom_proxy_for_settings("  ", "settings").unwrap_err();
+        assert!(err.to_string().contains("代理不能为空"));
+        assert_eq!(
+            validated_custom_proxy_for_settings("socks5h://127.0.0.1:1080", "settings").unwrap(),
+            "socks5h://127.0.0.1:1080"
+        );
+    }
+
+    #[test]
+    fn provider_preset_writes_only_expected_config() {
+        let merged = build_codex_config_preset(false);
+        let root_idx = merged.find("model_provider = \"donaapi\"").unwrap();
+        let provider_idx = merged.find("[model_providers.donaapi]").unwrap();
+        assert!(
+            root_idx < provider_idx,
+            "root config keys must stay before provider table:\n{merged}"
+        );
+        assert!(merged.contains("model = \"gpt-5.6-sol\""));
+        assert!(merged.contains("review_model = \"gpt-5.6-sol\""));
+        assert!(merged.contains("model_reasoning_effort = \"xhigh\""));
+        assert!(merged.contains("disable_response_storage = true"));
+        assert!(merged.contains("network_access = \"enabled\""));
+        assert!(!merged.contains("sandbox_mode"));
+        assert!(!merged.contains("approval_policy"));
+        assert!(merged.contains("windows_wsl_setup_acknowledged = true"));
+        assert!(merged.contains("name = \"DonaAPI\""));
+        assert!(merged.contains("base_url = \"https://donaapi.com/v1\""));
+        assert!(merged.contains("wire_api = \"responses\""));
+        assert!(merged.contains("requires_openai_auth = true"));
+        assert!(!merged.contains("http_headers"));
+        assert!(!merged.contains("x-openai-actor-authorization"));
+        assert!(!merged.contains("[mcp_servers.context7]"));
+        assert!(!merged.contains("[desktop]"));
+    }
+
+    #[test]
+    fn windows_provider_preset_enables_bundled_chinese_locale() {
+        let preset = build_codex_config_preset(true);
+
+        assert!(preset.contains("[desktop]\nlocaleOverride = \"zh-CN\""));
+        assert!(provider_config_keys(true).contains(&"desktop.localeOverride".to_string()));
+    }
+
+    #[test]
+    fn provider_preset_rewrites_conflicts_instead_of_merging() {
+        let original = [
+            "# model_provider = \"openai\"",
+            "model = \"gpt-5.1\"",
+            "",
+            "[model_providers.donaapi]",
+            "// base_url = \"https://old.example/v1\"",
+            "wire_api = \"responses\"",
+            "",
+        ]
+        .join("\n");
+
+        let preset = build_codex_config_preset(false);
+        let all_keys = provider_config_keys(false);
+        let (changed, added) = if preset == original {
+            (Vec::new(), Vec::new())
+        } else if original.trim().is_empty() {
+            (Vec::new(), all_keys)
+        } else {
+            (all_keys, Vec::new())
+        };
+
+        assert!(preset.contains("model_provider = \"donaapi\""));
+        assert!(preset.contains("model = \"gpt-5.6-sol\""));
+        assert!(preset.contains("review_model = \"gpt-5.6-sol\""));
+        assert!(preset.contains("model_reasoning_effort = \"xhigh\""));
+        assert!(!preset.contains("sandbox_mode"));
+        assert!(!preset.contains("approval_policy"));
+        assert!(preset.contains("name = \"DonaAPI\""));
+        assert!(preset.contains("base_url = \"https://donaapi.com/v1\""));
+        assert!(preset.contains("requires_openai_auth = true"));
+        assert!(!preset.contains("http_headers"));
+        assert!(!preset.contains("x-openai-actor-authorization"));
+        assert!(!preset.contains("https://old.example/v1"));
+        assert!(changed.contains(&"model_provider".to_string()));
+        assert!(changed.contains(&"model".to_string()));
+        assert!(changed.contains(&"model_providers.donaapi.base_url".to_string()));
+        assert!(changed.contains(&"model_providers.donaapi.requires_openai_auth".to_string()));
+        assert!(added.is_empty());
+    }
+
+    #[test]
+    fn provider_preset_is_idempotent() {
+        let once = build_codex_config_preset(true);
+        let twice = build_codex_config_preset(true);
+
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn rejects_non_empty_non_codex_install_root() {
+        let root = temp_path("codex-manager-non-empty-root");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("notes.txt"), b"not codex").unwrap();
+
+        let err = validate_install_root_path(&root.to_string_lossy()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("安装位置必须是空文件夹，或已有的 Codex 免安装版目录"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_portable_manifest(root: &std::path::Path, identity_name: &str) {
+        fs::write(
+            root.join("AppxManifest.xml"),
+            format!(
+                r#"<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10">
+  <Identity Name="{identity_name}" Publisher="CN=OpenAI OpCo, LLC" Version="26.707.3748.0" ProcessorArchitecture="x64" />
+</Package>"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn accepts_existing_codex_portable_install_root() {
+        let root = temp_path("codex-manager-existing-portable-root");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Codex.exe"), b"codex").unwrap();
+        write_portable_manifest(&root, "OpenAI.Codex");
+
+        let validated = validate_install_root_path(&root.to_string_lossy()).unwrap();
+        assert_eq!(validated, root.to_string_lossy());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_portable_root_with_foreign_identity() {
+        // An unpacked non-Codex payload (e.g. ChatGPT Classic) also carries a
+        // root-level ChatGPT.exe + AppxManifest.xml. Its identity fails the
+        // gate, so the non-empty directory must NOT be treated as replaceable.
+        let root = temp_path("codex-manager-foreign-portable-root");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ChatGPT.exe"), b"classic").unwrap();
+        write_portable_manifest(&root, "OpenAI.ChatGPT");
+
+        let err = validate_install_root_path(&root.to_string_lossy()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("安装位置必须是空文件夹，或已有的 Codex 免安装版目录"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn picked_non_empty_folder_installs_into_codex_child() {
+        let parent = temp_path("codex-manager-picked-parent");
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(parent.join("existing.txt"), b"user file").unwrap();
+
+        let validated = install_root_from_picked_dir(&parent.to_string_lossy()).unwrap();
+        assert_eq!(validated, parent.join("Codex").to_string_lossy());
+        // Validation maps to the Codex child but must not create it — the
+        // directory only appears at install time.
+        assert!(!parent.join("Codex").exists());
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn validation_does_not_create_the_target_directory() {
+        let root = temp_path("codex-manager-validate-no-create").join("Codex");
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+
+        let validated = validate_install_root_path(&root.to_string_lossy()).unwrap();
+        assert_eq!(validated, root.to_string_lossy());
+        // Validating a fresh location must leave the filesystem untouched.
+        assert!(
+            !root.exists(),
+            "validation must not create the install root"
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn validation_removes_parent_replace_probe() {
+        let parent = temp_path("codex-manager-validate-probe-cleanup");
+        let root = parent.join("Codex");
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).unwrap();
+
+        validate_install_root_path(&root.to_string_lossy()).unwrap();
+
+        assert!(!fs::read_dir(&parent).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(INSTALL_LOCATION_PROBE_PREFIX)
+        }));
+        assert!(!root.exists());
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_protected_install_root() {
+        let Some(program_files) = std::env::var_os("ProgramFiles") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(program_files).join("Codex");
+
+        let err = validate_install_root_path(&root.to_string_lossy()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("安装位置不能放在系统目录、管理员目录或磁盘根目录"));
+    }
+}

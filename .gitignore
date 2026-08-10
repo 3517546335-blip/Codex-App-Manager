@@ -1,0 +1,23 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+.devserver/
+scratch/
+
+.DS_Store
+*.log
+*.tmp
+
+.env
+.env.*
+!.env.example
+
+# Vendored Sparkle BinaryDelta helper (macOS delta updates) — fetched by
+# scripts/vendor-binary-delta.sh, not committed (~1.4 MB universal binary).
+src-tauri/resources/BinaryDelta
+
+# Vendored Windows Node runtime for the built-in zh-CN patcher — fetched by
+# scripts/vendor-node-windows.mjs during Windows release builds, not committed.
+src-tauri/resources/codex-zh-CN/runtime/

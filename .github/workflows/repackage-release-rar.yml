@@ -1,0 +1,76 @@
+name: Repackage release as RAR
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag, for example v0.6.0
+        required: true
+        default: v0.6.0
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PUBLIC_RELEASE_REPOSITORY: q4549286/Codex-Desktop-Releases
+  RELEASE_SITE: S1API
+
+jobs:
+  repackage:
+    if: ${{ startsWith(inputs.release_tag, 'v') }}
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download existing installers
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir -p dist
+          mkdir -p release-metadata
+          gh release download "$RELEASE_TAG" \
+            --repo "$PUBLIC_RELEASE_REPOSITORY" \
+            --pattern "*Windows_x64-setup.exe" \
+            --pattern "*macOS_aarch64.dmg" \
+            --pattern "*macOS_x86_64.dmg" \
+            --dir dist
+          gh release download "$RELEASE_TAG" \
+            --repo "$PUBLIC_RELEASE_REPOSITORY" \
+            --pattern "SHA256SUMS" \
+            --dir release-metadata
+
+      - name: Create user-facing RAR packages
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: bash scripts/create-release-rars.sh dist "$RELEASE_SITE" "$RELEASE_TAG"
+
+      - name: Upload RAR packages
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          grep -v '\.rar$' release-metadata/SHA256SUMS > release-metadata/SHA256SUMS.next
+          (
+            cd dist
+            sha256sum *.rar | sort -k2
+          ) >> release-metadata/SHA256SUMS.next
+          mv release-metadata/SHA256SUMS.next release-metadata/SHA256SUMS
+
+          gh release upload "$RELEASE_TAG" dist/*.rar \
+            --repo "$PUBLIC_RELEASE_REPOSITORY" \
+            --clobber
+          gh release upload "$RELEASE_TAG" release-metadata/SHA256SUMS \
+            --repo "$PUBLIC_RELEASE_REPOSITORY" \
+            --clobber
+
+          notes="docs/releases/${RELEASE_TAG}.md"
+          if [[ -f "$notes" ]]; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$PUBLIC_RELEASE_REPOSITORY" \
+              --notes-file "$notes"
+          fi

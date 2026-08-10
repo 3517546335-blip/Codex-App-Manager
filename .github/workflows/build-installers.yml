@@ -1,0 +1,139 @@
+name: Build Installers
+
+# Manual fork-friendly packaging workflow. It builds downloadable installers
+# without requiring Apple Developer ID, notarization, or Tauri updater secrets.
+# Use release.yml for signed/notarized production releases.
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Installer channel (DonaAPI must run from the donaapi branch)
+        required: true
+        default: s1api
+        type: choice
+        options:
+          - s1api
+          - donaapi
+
+concurrency:
+  group: build-installers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MANAGER_PUBLIC_RELEASE_REPOSITORY: ${{ inputs.channel == 'donaapi' && 'q4549286/Codex-Desktop-DonaAPI-Releases' || 'q4549286/Codex-Desktop-Releases' }}
+  RELEASE_SITE: ${{ inputs.channel == 'donaapi' && 'DonaAPI' || 'S1API' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: ${{ inputs.channel != 'donaapi' || github.ref_name == 'donaapi' }}
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            os: windows
+            label: windows-x64
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            target: aarch64-apple-darwin
+            os: macos
+            label: macos-apple-silicon
+          - name: macOS Intel
+            platform: macos-15-intel
+            target: x86_64-apple-darwin
+            os: macos
+            label: macos-intel
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Assert native offline zh-CN patch
+        shell: bash
+        run: bash scripts/assert-no-zh-patcher.sh
+
+      - run: npm ci
+
+      - name: Configure fork updater endpoint
+        shell: bash
+        run: node scripts/configure-release-updater.mjs
+
+      - name: Embed latest official Codex package
+        shell: bash
+        run: node scripts/prepare-offline-codex.mjs "${{ matrix.os }}" "${{ matrix.target }}"
+
+      - name: Vendor Sparkle BinaryDelta
+        if: matrix.os == 'macos'
+        shell: bash
+        run: bash scripts/vendor-binary-delta.sh
+
+      - name: Build installer
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            npm run tauri build -- --target "${{ matrix.target }}" && exit 0
+            echo "::warning::tauri build attempt ${attempt} failed; retrying in 20s"
+            sleep 20
+          done
+          echo "::error::tauri build failed after 3 attempts"
+          exit 1
+
+      - name: Assert offline Codex package inside the bundle
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            APP="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -name '*.app' | head -1)"
+            test -f "$APP/Contents/Resources/resources/offline/macos/metadata.json"
+            find "$APP/Contents/Resources/resources/offline/macos" -type f -size +400M | grep -q .
+          else
+            test -f "src-tauri/resources/offline/windows/latest/manifest"
+            test -f "src-tauri/resources/offline/windows/latest/checksums"
+            test "$(wc -c < src-tauri/resources/offline/windows/latest/win-x64)" -gt 400000000
+          fi
+
+      - name: Collect installer
+        shell: bash
+        run: |
+          DST="$GITHUB_WORKSPACE/dist-artifacts"
+          mkdir -p "$DST"
+          B="src-tauri/target/${{ matrix.target }}/release/bundle"
+          ARCH="${{ matrix.target }}"; ARCH="${ARCH%%-*}"
+          VERSION_TAG="v$(node -p "require('./package.json').version")"
+          shopt -s nullglob
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            for f in "$B"/dmg/*.dmg; do
+              cp "$f" "$DST/CodexDesktopManager_${RELEASE_SITE}_${VERSION_TAG}_macOS_${ARCH}_unsigned.dmg"
+            done
+          else
+            for f in "$B"/nsis/*-setup.exe; do
+              cp "$f" "$DST/CodexDesktopManager_${RELEASE_SITE}_${VERSION_TAG}_Windows_x64-setup.exe"
+            done
+          fi
+          ls -la "$DST"
+          test "$(find "$DST" -type f | wc -l | tr -d ' ')" != "0"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: installer-${{ env.RELEASE_SITE }}-${{ matrix.label }}
+          path: dist-artifacts/*
+          if-no-files-found: error

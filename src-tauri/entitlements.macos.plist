@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Hardened-runtime entitlements for the Codex Desktop 管理器 outer app.
+       WKWebView's JavaScript engine requires JIT; the unsigned-executable-memory
+       exception is the WebKit-recommended companion on hardened runtime. These
+       are applied only when signing the OUTER app with a real Developer ID
+       identity (see scripts/sign-macos-app.sh); adhoc/dev builds skip them.
+       The nested BinaryDelta helper is signed WITHOUT these — it needs none. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+</dict>
+</plist>

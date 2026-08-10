@@ -1,0 +1,21 @@
+[package]
+name = "codex-mac-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure-logic engine for planning Codex macOS updates from a Sparkle appcast (delta-aware)."
+
+[dependencies]
+roxmltree = "0.21"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+ed25519-dalek = "3"
+base64 = "0.22"
+log = "0.4"
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+url = "2.5"
+
+[[bin]]
+name = "mac_plan"
+path = "src/bin/mac_plan.rs"
